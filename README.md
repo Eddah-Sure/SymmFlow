@@ -1,16 +1,15 @@
-# DirectCrystalFlow
 
-**Symmetry-exact crystal generation by flow matching over asymmetric-unit site tokens.**
 
-DirectCrystalFlow represents a crystal as at most twenty canonically ordered latent tokens, one per site of the
+**SymmFlow: Symmetry-exact crystal generation by flow matching over asymmetric-unit site tokens.**
+
+SymmFlow represents a crystal as at most twenty canonically ordered latent tokens, one per site of the
 asymmetric unit, learns their distribution by flow matching, and decodes every token onto an exact Wyckoff
 subspace before regenerating the cell by orbit expansion. Every generated structure is therefore closed under its
 space group by construction, and the space group can be requested at sampling time.
 
-<p align="center"><img src="docs/assets/overview.png" alt="Overview of DirectCrystalFlow" width="720"></p>
+<p align="center"><img src="docs/assets/overview.png" alt="Overview of SymmFlow" width="720"></p>
 
-> **Status:** research code accompanying a manuscript in preparation. Results will be linked here once the paper
-> is available. Interfaces may change.
+
 
 ## Contents
 
@@ -20,10 +19,9 @@ space group by construction, and the space group can be requested at sampling ti
 4. [Training](#training)
 5. [Generating crystals](#generating-crystals)
 6. [Evaluation and figures](#evaluation-and-figures)
-7. [DFT validation](#dft-validation)
-8. [The symmetry correction (`symfix`)](#the-symmetry-correction-symfix)
-9. [Configuration and privacy](#configuration-and-privacy)
-10. [Citation and licence](#citation-and-licence)
+7. [The symmetry correction (`symfix`)]
+8. [Configuration](#configuration)
+9. [Citation and licence](#licence)
 
 ## Repository layout
 
@@ -34,24 +32,21 @@ src/
 scripts/
   visualize.py         trajectories, and a panel of crystals under requested space groups
   make_figures.py      results figures from an evaluation JSON
-  dft_stability.py     VASP relaxation and energy above the Materials Project hull
   README.md            what each script needs (evaluate.py is still to be added)
 data/ data_prep/       where the dataset goes, and the scripts that build it
 checkpoints/ results/  git-ignored outputs
 docs/                  architecture, training, evaluation and DFT notes
-tools/                 check_private_paths.py (privacy check, also run in CI and pre-commit)
 tests/                 hygiene and smoke tests that need no GPU
 ```
 
 ## Installation
 
 ```bash
-git clone https://github.com/<your-username>/DirectCrystalFlow.git
-cd DirectCrystalFlow
+git clone https://github.com/Eddah-Sure/SymmFlow.git
+cd SymmFlowFlow
 python -m venv .venv && source .venv/bin/activate
 # install PyTorch and PyTorch Geometric for your CUDA version first (see their install pages), then:
-pip install -e ".[eval,dft,dev]"
-cp .env.example .env        # edit the paths; the file is git-ignored
+pip install -e ".[eval,dev]"
 set -a; source .env; set +a
 ```
 
@@ -60,12 +55,11 @@ find the model.
 
 ## Data
 
-The model trains on the mined MP-20 dataset (`train/ val/ test/`). Point `MP20_ROOT` at it; no path is stored in
-the code. Layout and sources are in [`data/README.md`](data/README.md).
+The model trains on the mined MP-20 dataset (`train/ val/ test/`). 
 
 ## Training
 
-All three stages run from one command. If no pretrained encoder is given, Stage 1 runs first.
+All three stages run from one command. 
 
 ```bash
 python src/sitetokens.py --data-root "$MP20_ROOT"
@@ -101,11 +95,6 @@ The visualiser installs the symmetry correction before generating and refuses to
 `scripts/make_figures.py emf_eval_results.json` draws the results figures from that file only, so figures and text
 cannot drift apart. See [`docs/EVALUATION.md`](docs/EVALUATION.md).
 
-## DFT validation
-
-`scripts/dft_stability.py` relaxes selected structures with VASP (Materials Project settings, via pymatgen and
-custodian) and computes the energy above the full Materials Project hull. It needs a licensed VASP and a free
-Materials Project API key. See [`docs/DFT.md`](docs/DFT.md).
 
 ## The symmetry correction (`symfix`)
 
@@ -114,10 +103,9 @@ Wyckoff codebook was mined. `symfix.install_stored_basis_symmetry` replaces it w
 Any script that generates structures must install it before sampling; without it, cells come out several times too
 large and some groups (e.g. `Pnma`) fail. `symfix` is applied automatically by `scripts/visualize.py`.
 
-## Configuration and privacy
+## Configuration
 
-Locations come from environment variables (`.env.example`) or flags; no machine-specific path, e-mail address or
-key is stored in the code. Before every commit run
+Locations come from environment variables (`.env.example`) or flags
 
 ```bash
 python tools/check_private_paths.py
@@ -125,8 +113,8 @@ python tools/check_private_paths.py
 
 (also run by CI and, if you install it, by pre-commit: `pre-commit install`).
 
-## Citation and licence
+## Licence
 
-See [`CITATION.cff`](CITATION.cff) (fill in the authors and the DOI when available). Code is released under the
+Code is released under the
 MIT licence, see [`LICENSE`](LICENSE). The Materials Project and MP-20 data have their own licences and are not
 distributed here.
