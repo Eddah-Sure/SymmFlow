@@ -29,12 +29,6 @@ space group by construction, and the space group can be requested at sampling ti
 src/
   sitetokens.py        the model, losses, data pipeline and 3-stage training (11 numbered sections)
   symfix.py            stored-basis symmetry correction applied before generation
-scripts/
-  visualize.py         trajectories, and a panel of crystals under requested space groups
-  make_figures.py      results figures from an evaluation JSON
-  README.md            what each script needs (evaluate.py is still to be added)
-data/ data_prep/       where the dataset goes, and the scripts that build it
-checkpoints/ results/  git-ignored outputs
 docs/                  architecture, training, evaluation and DFT notes
 tests/                 hygiene and smoke tests that need no GPU
 ```
@@ -43,7 +37,7 @@ tests/                 hygiene and smoke tests that need no GPU
 
 ```bash
 git clone https://github.com/Eddah-Sure/SymmFlow.git
-cd SymmFlowFlow
+cd SymmFlow
 python -m venv .venv && source .venv/bin/activate
 # install PyTorch and PyTorch Geometric for your CUDA version first (see their install pages), then:
 pip install -e ".[eval,dev]"
