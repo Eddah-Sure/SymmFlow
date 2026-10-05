@@ -2,7 +2,7 @@
 
 **SymmFlow: Symmetry-exact crystal generation by flow matching over asymmetric-unit site tokens.**
 
-SymmFlow represents a crystal as at most twenty canonically ordered latent tokens, one per site of the
+SymmFlow represents a crystal as canonically ordered latent tokens, one per site of the
 asymmetric unit, learns their distribution by flow matching, and decodes every token onto an exact Wyckoff
 subspace before regenerating the cell by orbit expansion. Every generated structure is therefore closed under its
 space group by construction, and the space group can be requested at sampling time.
