@@ -1,59 +1,5 @@
 """
 symfix.py -- make generation use the SAME cell basis the model was trained in.
-
-THE BUG THIS FIXES
-------------------
-DATA.py stores every MP-20 structure "as_is" (CELL_SETTING = "as_is"), which for
-centred groups (F, I, C, A, R) is usually a PRIMITIVE cell, and it stores the
-Wyckoff projectors (P, o), the in-cell multiplicities and the symmetry
-operations in THAT cell's fractional basis.  DATA.py even warns about this:
-
-    "Expand orbits with the SAVED per-structure sym_rot/sym_trans (valid in the
-     stored basis), NOT with SpaceGroup.from_int_number(n).symmetry_ops
-     (conventional setting) -- mixing the two produces wrong structures."
-
-SITETOKENS.py nevertheless builds `sym_rot_lut` / `_SG_OPS_CACHE` from
-`SpaceGroup.from_int_number(sg).symmetry_ops` (CONVENTIONAL basis, including the
-centring translations), and `project_to_crystal_family` imposes CONVENTIONAL
-metrics (e.g. 90 deg for cubic) on a lattice head that was trained on the stored
-(e.g. 60 deg rhombohedral-primitive) cells.  At sampling time the decoder
-therefore projects coordinates with stored-basis projectors and expands them with
-conventional-basis operations.  Consequences seen in the evaluation log:
-
-  * atoms/cell far above MP-20 (mean 35.9, max 256; Fm-3m up to 144):
-    centring translations multiply every orbit by 2-4, and a point that is
-    special in the stored basis is generally NOT special in the conventional
-    one, so it gets the general-position multiplicity (up to 192);
-  * too few atoms on special positions (55% vs 77%) -- same reason;
-  * wrong stoichiometry -> lower SMACT validity, worst for F-centred groups
-    (Fm-3m 53%);
-  * near-coincident images -> conflicts -> cell inflation (VPA 1.24x median);
-  * Pnma 0% match (stored orthorhombic cells are often in a non-standard
-    setting, so stored projectors and standard operations disagree).
-
-THE FIX (no re-mining, no change to the checkpoint)
----------------------------------------------------
-For every space group, take the operation set that the training data actually
-used most often (the "modal stored basis"), build the Wyckoff codebook ONLY from
-structures stored in that same basis, and use those operations everywhere the
-model expands, counts multiplicities or checks conflicts.  The lattice is
-symmetrised by averaging its metric tensor over the point group,
-    G_sym = (1/|G|) sum_R  R^T G R ,      G = L L^T  (rows of L = lattice vectors),
-which is the exact orthogonal projection onto metrics invariant under the group
-and works in any basis (it reduces to the usual crystal-family constraints in
-the standard setting).  Everything the decoder and lattice head were trained on
-(Stage 1) is in the stored basis, so this makes sampling consistent with
-training.  Generated cells then have MP-20-like atom counts by construction.
-
-USAGE
------
-    import symfix
-    report = symfix.install_stored_basis_symmetry(model, [train_ds],
-                                                  module=<SITETOKENS module>)
-    symfix.roundtrip_check([test_ds], report)     # no network, no GPU needed
-
-Call it AFTER any load_state_dict / load_checkpoint (the codebook buffers are
-persistent and a later checkpoint load would overwrite them).
 """
 from __future__ import annotations
 
@@ -66,9 +12,6 @@ import torch
 MAX_OPS = 192
 
 
-# ---------------------------------------------------------------------------
-# operation-set signatures
-# ---------------------------------------------------------------------------
 def _canon_ops(rot, trans, decimals=3):
     """Integer rotations + translations reduced to [0,1), as a sorted tuple."""
     rot = np.rint(np.asarray(rot, dtype=np.float64).reshape(-1, 3, 3)).astype(np.int64)
@@ -102,9 +45,6 @@ def _is_closed_group(rot, trans, tol=1e-3):
     return True
 
 
-# ---------------------------------------------------------------------------
-# mining
-# ---------------------------------------------------------------------------
 def mine_stored_basis_ops(datasets, verbose=True):
     """Per space group: the modal operation set among training structures.
 
@@ -174,9 +114,6 @@ def _family_datasets(datasets, family):
     return [_FilteredDataset(gd, sgs)]
 
 
-# ---------------------------------------------------------------------------
-# operation look-up tables
-# ---------------------------------------------------------------------------
 def _identity_first(ops):
     return sorted(ops, key=lambda rt: (np.abs(np.asarray(rt[0]) - np.eye(3)).sum()
                                        + np.abs(np.asarray(rt[1])).sum()))
@@ -210,15 +147,9 @@ def build_op_tables(table, module, max_ops=MAX_OPS):
     return (R, T, ok), ops_by_sg, source
 
 
-# ---------------------------------------------------------------------------
-# lattice: metric symmetrisation (replaces project_to_crystal_family)
-# ---------------------------------------------------------------------------
+
 def make_metric_projector(module):
     """project_to_crystal_family(p, sg) -> p, basis-agnostic.
-
-    p: (B, >=6) lattice parameters (a, b, c, alpha, beta, gamma in degrees).
-    The metric G = L L^T is averaged over the rotations of the group in the
-    SAME basis the operations are expressed in.  Differentiable.
     """
     def project_to_crystal_family(p, sg):
         R_all, _, ok_all = module._SYM_TENSORS
@@ -247,16 +178,9 @@ def make_metric_projector(module):
     project_to_crystal_family.__doc__ = make_metric_projector.__doc__
     return project_to_crystal_family
 
-
-# ---------------------------------------------------------------------------
-# install
-# ---------------------------------------------------------------------------
 def install_stored_basis_symmetry(model, train_datasets, module, verbose=True,
                                   rebuild_codebook=True):
-    """Switch a loaded DirectCrystalFlow (and its module) to stored-basis symmetry.
-
-    Must be called after any checkpoint load.  Idempotent.
-    """
+  
     table, family = mine_stored_basis_ops(train_datasets, verbose=verbose)
     # build fallback ops BEFORE the module caches are replaced
     (R, T, ok), ops_by_sg, source = build_op_tables(table, module)
@@ -313,10 +237,6 @@ def install_stored_basis_symmetry(model, train_datasets, module, verbose=True,
                               for f, sg, v in _big))
     return report
 
-
-# ---------------------------------------------------------------------------
-# network-free checks (run these first; they need no checkpoint quality)
-# ---------------------------------------------------------------------------
 def _orbit(f, rot, trans, L, tol_ang=0.05):
     img = (np.einsum("mij,j->mi", rot, f) + trans) % 1.0
     keep = []
@@ -333,11 +253,6 @@ def _orbit(f, rot, trans, L, tol_ang=0.05):
 def roundtrip_check(datasets, report, module=None, n_max=3000, seed=0, verbose=True):
     """Expand each structure's TRUE asymmetric unit and compare with the stored cell.
 
-    For structures in their group's modal basis, expansion with the installed
-    (stored-basis) operations must reproduce the stored atom count and
-    composition exactly.  If `module` is given, the same is done with the
-    conventional pymatgen operations the old code used, to quantify the bug.
-    Also checks that metric symmetrisation leaves the true lattice unchanged.
     """
     table = report["table"]
     rng = np.random.default_rng(seed)
