@@ -1,0 +1,25 @@
+# Core (training, symmetry, sampling)
+numpy
+pandas
+scipy
+torch>=2.1
+torch_geometric
+pymatgen
+spglib
+tqdm
+matplotlib
+scikit-learn
+
+# Evaluation (scripts/evaluate.py) and structure drawing
+matminer
+smact
+ase
+mattersim        # universal interatomic potential used for relaxation
+
+# DFT validation (scripts/dft_stability.py)
+custodian
+mp-api
+
+# Development
+pytest
+ruff

@@ -1,0 +1,37 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "directcrystalflow"
+version = "0.1.0"
+description = "Symmetry-exact crystal generation by flow matching over asymmetric-unit site tokens"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+  "numpy", "pandas", "scipy", "torch>=2.1", "torch_geometric",
+  "pymatgen", "spglib", "tqdm", "matplotlib", "scikit-learn",
+]
+
+[project.optional-dependencies]
+eval = ["matminer", "smact", "ase", "mattersim"]
+dft  = ["custodian", "mp-api"]
+dev  = ["pytest", "ruff"]
+
+# The model and the symmetry correction are top-level modules (`import sitetokens`,
+# `import symfix`) because the scripts, and symfix itself, address them by name.
+[tool.setuptools]
+package-dir = { "" = "src" }
+py-modules = ["sitetokens", "symfix"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+# Only real errors: syntax problems and undefined names. Style is left alone on purpose.
+select = ["E9", "F63", "F7", "F82"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
