@@ -27,7 +27,7 @@ coverage recall/precision at standard thresholds.
 5. Conditional generation It supports formation-energy-conditioned generation and shifts
 generated structures in the requested property direction
 
-<p align="center"><img src="docs/fig2_unconditional.pdf" alt="Generation" width="720"></p>
+
 
 ## Contents
 
