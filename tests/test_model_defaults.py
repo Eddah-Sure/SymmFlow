@@ -2,7 +2,7 @@
 import re
 from pathlib import Path
 
-SRC = (Path(__file__).resolve().parents[1] / "src" / "sitetokens.py").read_text(encoding="utf-8")
+SRC = (Path(__file__).resolve().parents[1] / "src" / "_").read_text(encoding="utf-8")
 
 
 def test_data_root_comes_from_environment():
