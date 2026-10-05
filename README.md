@@ -108,13 +108,6 @@ The visualiser installs the symmetry correction before generating and refuses to
 cannot drift apart. See [`docs/EVALUATION.md`](docs/EVALUATION.md).
 
 
-## The symmetry correction (`symfix`)
-
-The orbit expansion in the model builds cells in a conventional basis that can differ from the basis in which the
-Wyckoff codebook was mined. `symfix.install_stored_basis_symmetry` replaces it with expansion in the stored basis.
-Any script that generates structures must install it before sampling; without it, cells come out several times too
-large and some groups (e.g. `Pnma`) fail. `symfix` is applied automatically by `scripts/visualize.py`.
-
 ## Configuration
 
 Locations come from environment variables (`.env.example`) or flags
