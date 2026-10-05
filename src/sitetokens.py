@@ -1,4 +1,4 @@
-"""DirectCrystalFlow -- conditional crystal generation for MP-20.
+"""SymmFlow -- conditional crystal generation for MP-20.
 
     noise ~ N(0, I)  ->  LatentSetFlow(z, t, cond(y, sg))  ->  site tokens
                      ->  SiteDecoder  ->  asymmetric unit  ->  cell  ->  crystal
@@ -26,7 +26,7 @@ Layout (see the section banners):
    3 symmetry                              9 training
    4 encoder                              10 sample-time post-processing, metrics
    5 generator                            11 configuration and entry points
-   6 DirectCrystalFlow
+   6 SymmFlow
 
 Requires torch, torch_geometric, numpy, pandas; pymatgen for the space-group
 operations (without it every symmetry number is inert and the file says so).
@@ -52,9 +52,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.utils import to_dense_batch
 warnings.filterwarnings('ignore')
 
-# ==============================================================================
-# 1  CONSTANTS, CHEMISTRY TABLES AND DIAGNOSTIC WARNINGS
-# ==============================================================================
+
 
 _DATA_WARNED = set()
 
@@ -206,9 +204,6 @@ def build_element_phys_features(atomic_numbers, elem_props):
         ]
     return phys
 
-# ==============================================================================
-# 2  GEOMETRY: LATTICES, MINIMUM IMAGE, GRAPH CONSTRUCTION
-# ==============================================================================
 
 def safe_norm(x, dim=-1, eps=1e-12, keepdim=False):
     return (x.pow(2).sum(dim=dim, keepdim=keepdim) + eps).sqrt()
@@ -293,11 +288,6 @@ def _min_image_disp_block(fa, fb, L, n_images=1, chunk=9):
 def min_image_disp(fa: torch.Tensor, fb: torch.Tensor, L: torch.Tensor,
                    n_images: int = 1, chunk: int = 9, row_chunk: int = None):
     """Minimum-image displacement/distance between two padded coordinate sets.
-
-    The naive implementation materialises (B, A, A, n_shift, 3), which is
-    multiple GB once A reaches a few hundred atoms (as it does after symmetry
-    expansion). Both the image axis and the first atom axis are therefore
-    chunked so peak memory stays bounded regardless of A.
     """
     A = fa.size(1)
     B = fa.size(0)
@@ -340,14 +330,6 @@ def min_image_shift(frac: torch.Tensor, L: torch.Tensor, n_images: int = 1,
 
 def lattice_self_edges(L, cutoff=6.0, max_self=6, n_images=2):
     """The shortest non-zero lattice translations within `cutoff`.
-
-    A crystal whose cell is smaller than the cutoff has real bonds from an atom
-    to its OWN periodic images. Those i -> i + t edges are the only ones that
-    carry bare lattice-vector lengths, so dropping them leaves the encoder --
-    which consumes scalar distances only -- with no direct evidence of the cell
-    at all, while LatticeHead is still asked to regress six cell parameters
-    from that latent. Returns (offsets, lengths, valid) of shape
-    (B, max_self, 3) / (B, max_self) / (B, max_self).
     """
     B = L.size(0)
     shifts = _image_shifts(n_images, L.device, L.dtype)          # (S, 3)
@@ -363,20 +345,6 @@ def lattice_self_edges(L, cutoff=6.0, max_self=6, n_images=2):
 
 def compact_by_mask(mask, *tensors):
     """Move occupied slots to the front and cut the padding off the tail.
-
-    `symmetry_orbit` returns a (B, n_ops * A) tensor in which most slots are
-    empty: every crystal gets the full capacity whether or not its group has
-    that many operations, and the asymmetric unit is padded to `n_sites` before
-    it is replicated. Everything downstream then pays for the padding at full
-    price -- `build_edges_from_geometry` allocates (max_deg + max_self) edge
-    slots for every slot including the empty ones, and `EquivariantGNNConv`
-    carries a (B, E, C, 3) message tensor per layer, which at B=32, E=2304,
-    C=128 is 113 MB of activation that exists to move zeros around.
-
-    Dropping the tail is exact, not an approximation: masked slots contribute
-    nothing to any sum in the encoder. The order among occupied slots is
-    preserved (stable sort), so the identity block -- the asymmetric unit
-    itself, which `symmetry_orbit` always emits first -- stays in front.
     """
     keep_n = int(mask.bool().sum(1).max().clamp(min=1))
     if keep_n >= mask.size(1):
@@ -400,9 +368,6 @@ def build_edges_from_geometry(frac, L, mask, cutoff=6.0, max_deg=12, n_images=1,
                               max_self=6):
     """Padded (src, dst, offset, emask) for a structure that has no dataset graph.
 
-    Needed to push a *generated* crystal back through the frozen encoder. Now
-    includes periodic self-edges so the graph matches the (fixed) dataset graph
-    construction; see lattice_self_edges.
     """
     B, A, _ = frac.shape
     sft, d = min_image_shift(frac, L, n_images)
@@ -444,9 +409,7 @@ def edge_geometry(frac, L, src, dst, offset):
     dvec = torch.einsum('bek,bkl->bel', df, L)
     return dvec, safe_norm(dvec)
 
-# ==============================================================================
-# 3  SYMMETRY: SPACE-GROUP OPERATIONS, WYCKOFF TABLES, ORBITS
-# ==============================================================================
+
 
 _SG_OPS_CACHE = {}
 
@@ -526,36 +489,12 @@ def _orbit_min_contact(orbit, L_use, invL):
     np.fill_diagonal(dd, np.inf)
     return float(dd.min())
 
-
-# Escalating snap tolerances used by `_physical_site_snap`. The first entry is
-# the caller's own tolerance; the rest are only reached when the orbit built
-# at the previous tolerance still holds a sub-physical contact.
 _SNAP_LADDER = (0.02, 0.035, 0.05, 0.07, 0.10, 0.14, 0.20, 0.26)
 
 
 def _physical_site_snap(f, ops_arr, L_use, invL, base_tol=SYM_SNAP_TOL,
                         min_dist=0.75, max_tol=0.26):
-    """Snap one site onto a special position only as far as PHYSICS requires.
-
-    A fixed fractional tolerance cannot separate the two failure modes:
-
-      * too loose, and every general position is dragged onto a special one,
-        halving multiplicities it shouldn't;
-      * too tight (e.g. 0.01), and a site sitting 0.015 fractional from a
-        mirror keeps its full multiplicity, so the group places its own
-        image 0.03 fractional away -- in a 10 A cell, a 0.3 A contact
-        between two atoms of the same element, which is exactly the
-        duplicate-atom symptom this function exists to prevent.
-
-    The criterion that actually distinguishes them is not a fractional
-    distance, it is whether the resulting orbit is a physically possible set
-    of atoms: build the orbit at the caller's tolerance, and only if it holds
-    a pair closer than `min_dist` escalate the tolerance until the offending
-    images MERGE (the site becomes special, multiplicity correctly drops) or
-    the ladder runs out.
-
-    `f` is a single site (3,) or (1, 3). Returns (snapped_f, orbit, tol_used,
-    min_contact, escalated).
+    """Snap one site onto a special position.
     """
     f1 = np.asarray(f, dtype=float).reshape(1, 3)
     tol = float(base_tol)
@@ -580,15 +519,6 @@ def _physical_site_snap(f, ops_arr, L_use, invL, base_tol=SYM_SNAP_TOL,
 
 def _orbit_of(f, ops_arr, L_use, invL, tol_sq=None, merge_dist=0.75):
     """Distinct images of one site under the group, as an (m, 3) array.
-
-    `merge_dist` (Angstrom) is the hard-sphere floor below which two images
-    are treated as the SAME physical atom even without having been through
-    `_physical_site_snap` -- a backstop for whatever the snap ladder above
-    could not fully resolve (it can run out at `max_tol` without reaching
-    `min_dist`). `tol_sq`, if given explicitly, overrides it (squared-Angstrom
-    units): callers that already ran the escalating snap want the tight
-    numerical-duplicate tolerance here, since by that point genuinely
-    coincident images should differ only by float error.
     """
     ts = float(tol_sq) if tol_sq is not None else float(merge_dist) ** 2
     rot, trans = ops_arr
@@ -616,14 +546,6 @@ _WYCKOFF_PTS = None
 
 def _wyckoff_axis_values():
     """Grid of candidate coordinate values, including derived ones.
-
-    Sites are found by testing which grid points have a non-trivial stabiliser.
-    A product grid over {fixed} u {x} alone cannot express sites whose
-    coordinates are LINKED, e.g. (x, 2x, z) -- Wyckoff 12k of P6_3/mmc and its
-    relatives across the trigonal/hexagonal groups -- or (x, -x, z), because
-    2*0.137 = 0.274 and 1 - 0.137 = 0.863 are not on the grid and the stabiliser
-    test runs at tol = 1e-4. Adding the derived values 2x, -x, 1/2 +- x and
-    1/2 - 2x makes those linked forms representable.
     """
     vals = set(float(v) for v in _WYCKOFF_AXIS_FIXED)
     for x in _WYCKOFF_AXIS_FREE:
@@ -765,21 +687,6 @@ def _build_wyckoff_tensors(max_wyckoff=_WYCKOFF_MAX):
 def wyckoff_multiplicity_table(P_lut, o_lut, valid_lut, probe=(0.137, 0.271, 0.393),
                                tol_frac=1e-3, verbose=True):
     """Multiplicity of every (space group, Wyckoff class) in the codebook.
-
-    The multiplicity of a Wyckoff class is a PROPERTY OF THE GROUP, not
-    something a network has to estimate: take a generic point of the class's
-    affine subspace, x = P u + o, and count its distinct images under the
-    group.  `SiteMultiplicityHead` was regressing exactly this number from the
-    latent, and `_build_cell` sized the cell volume from that regression -- a
-    learned approximation to a table that can be computed once, exactly, and
-    which must agree with what `expand_generated` will actually emit (it uses
-    the same operation set).  Disagreement between the two is what produced
-    cells whose volume was sized for an atom count that never materialised.
-
-    The count is over DISTINCT images at `tol_frac` in fractional coordinates,
-    the same criterion `orbit_multiplicity` and `_orbit_of` apply, so centred
-    lattices (where several operations differ by a centring translation that
-    happens to fix the site) come out right.
     """
     import time as _time
     R, T, ok = _get_sym_op_tensors()
@@ -863,15 +770,6 @@ def _get_wyckoff_tensors(max_wyckoff=_WYCKOFF_MAX, use_cache=True):
 
 def build_wyckoff_codebook(datasets, max_w=27, verbose=True):
     """(space group, Wyckoff letter) -> (projector, offset), taken from the data.
-
-    The mining pipeline already computes, per atom, the exact affine projector onto
-    its site-symmetry fixed-point set, P = (1/|S|) sum_S R and o = f - P f, in that
-    structure's own basis. Enumerating classes from a candidate-point grid instead
-    misses every class whose offset falls off the grid: only 49.8% of sites resolved
-    against it on this dataset.
-
-    Where several structures give different offsets for one class (different orbit
-    representatives) the modal value is taken, which is a valid site either way.
     """
     from collections import Counter
     acc = {}
@@ -996,15 +894,6 @@ def _get_sym_op_tensors(max_ops=_SYM_MAX_OPS, use_cache=True):
 
 def _first_occurrence(f, ok, L=None, tol_ang=1e-2, elem_budget=_MID_ELEM_BUDGET):
     """Mark, for each atom, the images that are not duplicates of an earlier one.
-
-    f  (B, M, A, 3) images of A atoms under M operations, op 0 = identity.
-    ok (B, M)       which operations exist for each sample.
-    Returns (B, M, A) bool, True on the first image of each coincident group.
-
-    Replaces the sequential `for g in range(1, M)` loop that both
-    `orbit_multiplicity` and `symmetry_orbit` ran -- up to 191 dependent kernel
-    launches per call, several calls per training step. The comparison is
-    blocked over the query axis so peak memory stays bounded regardless of |G|.
     """
     B, M, A, _ = f.shape
     dup = torch.zeros(B, M, A, dtype=torch.bool, device=f.device)
@@ -1025,16 +914,7 @@ def _first_occurrence(f, ok, L=None, tol_ang=1e-2, elem_budget=_MID_ELEM_BUDGET)
     return ok.view(B, M, 1) & ~dup
 
 def _clamp_st(x, lo, hi):
-    """Clamp the VALUE, pass the gradient straight through.
-
-    A hard `torch.maximum(V, floor)` has zero gradient wherever it is
-    saturated, and the lattice head starts stage 3 saturated at the floor
-    because it is out of distribution on rolled-out latents. The vpa and
-    lattice losses then say "the cell is too small" and nothing receives that
-    signal -- the very situation the clamp exists to survive. Straight-through
-    keeps the geometry inside the band while still letting the head be told
-    which way to move.
-    """
+    
     xc = torch.minimum(torch.maximum(x, lo), hi)
     return x + (xc - x).detach()
 
@@ -1043,19 +923,6 @@ def orbit_multiplicity(frac, mask, sg, R_lut, T_lut, ok_lut, L=None,
                        snap_tol=SYM_SNAP_TOL, tol_ang=1e-2, merge_dist=None):
     """Wyckoff multiplicity of each decoded atom under its space group.
 
-    `snap_tol` is in FRACTIONAL units and decides which operations count as
-    fixing the site (site-symmetry snap, matching `_site_symmetry_snap` on the
-    numpy side). After the snap, this counts DISTINCT images of each site
-    rather than dividing |G| by a stabiliser order: two images coincide the
-    instant either is on a special position OR the two general-position images
-    happen to fall within `merge_dist`/`tol_ang` of each other, and the
-    stabiliser-order route only ever captured the first case.
-
-    `merge_dist` (Angstrom, requires L) makes the COUNT agree with what
-    `expand_generated`/`_physical_site_snap` will actually emit at sample
-    time: two images closer than the hard-sphere floor are merged into one
-    atom there, so counting them separately here sizes the cell (vpa, ncell,
-    multiplicity-weighted composition) for atoms that never materialise.
     """
     B, A, _ = frac.shape
     sgi = sg.view(-1).clamp(1, 230).long() - 1
@@ -1098,26 +965,6 @@ def symmetry_orbit(frac, mask, types, sg, R_lut, T_lut, ok_lut, n_ops=8,
                    stochastic=True, L=None, dedup=True, tol_ang=1e-2,
                    select='random'):
     """Differentiable partial orbit of the asymmetric unit under the space group.
-
-    Returns (frac_img, mask_img, types_img) of shape (B, n_ops*A, ...). Operation
-    0 is the identity, so the asymmetric unit itself is always included.
-
-    `dedup` is essential and was missing. An atom on a special Wyckoff position
-    is EXACTLY fixed by every operation in its site-symmetry group, so those
-    operations reproduce the atom on top of itself. `hardcore_repulsion`'s
-    `eye` only removes the op-0 self pair, so each remaining stabiliser op
-    contributed a spurious distance-0 clash -- a penalty minimised by moving to
-    the general position, which is precisely what the Wyckoff machinery exists
-    to produce. Duplicate images are masked out here so the orbit is a
-    genuine set.
-
-    `select='nearest'` ranks operations by the displacement they induce on an
-    occupied site and keeps the closest, rather than sampling uniformly. The
-    operation that creates a short contact is the one that ALMOST stabilises a
-    site (an atom 0.015 from a mirror is put 0.030 away by that mirror and by
-    no other operation); a uniform sample finds it a small minority of the
-    time in a group with many operations, so the repulsion term mostly never
-    saw the clash it exists to price.
     """
     B, A, _ = frac.shape
     sgi = sg.view(-1).clamp(1, 230).long() - 1
@@ -1170,10 +1017,6 @@ def symmetry_orbit(frac, mask, types, sg, R_lut, T_lut, ok_lut, n_ops=8,
     t = types.unsqueeze(1).expand(B, n, A)
     return f.reshape(B, n * A, 3), m.reshape(B, n * A), t.reshape(B, n * A)
 
-
-# ==============================================================================
-# 4  ENCODER: MESSAGE PASSING AND THE CANONICAL SITE-TOKEN SET
-# ==============================================================================
 
 class RBF(nn.Module):
     def __init__(self, num_rbf=16, cutoff=6.0):
@@ -1260,7 +1103,7 @@ class EquivariantGNNConv(nn.Module):
         E = src.size(1)
         w = em.to(s.dtype).unsqueeze(-1)
 
-        # ---- message ------------------------------------------------------
+       
         phi = self.msg(s)
         phi_j = torch.gather(phi, 1, dst.unsqueeze(-1).expand(-1, -1, 3 * C))
         Wf = self.filt(self.rbf(dist))
@@ -1283,7 +1126,7 @@ class EquivariantGNNConv(nn.Module):
         s = s + s_agg
         v = v + v_agg
 
-        # ---- update -------------------------------------------------------
+        
         vt = v.transpose(-1, -2)                                 # (B, A, 3, C)
         Uv = self.U(vt).transpose(-1, -2)
         Vv = self.V(vt).transpose(-1, -2)
@@ -1296,11 +1139,6 @@ class EquivariantGNNConv(nn.Module):
 
 class _SetBlock(nn.Module):
     """Pre-norm self-attention + FFN over a latent set.
-
-    A plain transformer block. This is what replaces routing-by-agreement:
-    tokens exchange information through attention, with no competition for a
-    fixed pool of routing mass, so there is no mechanism that can push every
-    token onto one shared pooled vector.
     """
 
     def __init__(self, dim, heads=4, mult=2, dropout=0.0):
@@ -1322,29 +1160,10 @@ class _SetBlock(nn.Module):
 
 def canonical_site_order(types, frac, mask, n_sites):
     """Deterministic ordering of a crystal's sites; sort key (Z, x, y, z).
-
-    Flow matching regresses a velocity field from exchangeable noise onto this set,
-    so crystal -> tensor has to be single valued. If one crystal could be written in
-    several orders the target is a mixture of them and its conditional mean -- every
-    token equal to the average site -- is the minimiser.
-
-    Coordinates are rounded to a 1e-4 grid BEFORE the modulo, so frac = -1e-7 and
-    frac = +1e-7 land in the same bucket rather than at opposite ends of the key.
-
-    Returns (perm, keep): perm (B, n_sites) indices into the atom axis, keep
-    (B, n_sites) marking slots that hold a real site.
     """
     B, A = mask.shape
     dev = mask.device
-    # Integer key: float64 cannot hold four fields at 1e4 resolution without the
-    # coordinate digits bleeding into the atomic-number digit at frac -> 1.0.
-    # Round FIRST, then wrap: rounding after the modulo sends frac = -1e-7 to
-    # bucket 10000 and frac = +1e-7 to bucket 0, i.e. two crystallographically
-    # identical coordinates to opposite ends of the sort. MP-20 asymmetric units
-    # are full of sites at exactly 0 and 1/2, and mined coordinates land a few
-    # 1e-7 either side of them, so that discontinuity reassigns whole crystals
-    # to a different token order at random. `% 10000` after rounding makes the
-    # key periodic: bucket 10000 and bucket 0 are the same bucket.
+   
     q = (torch.round(frac.double() * 1e4).long() % 10000)
     key = (types.long() * 10 ** 15
            + q[..., 0] * 10 ** 10 + q[..., 1] * 10 ** 5 + q[..., 2])
@@ -1362,16 +1181,6 @@ def canonical_site_order(types, frac, mask, n_sites):
 
 class FracFourier(nn.Module):
     """Periodic sin/cos features of an atom's own fractional coordinate.
-
-    Without these the encoder is blind to absolute position: node inputs are element
-    embeddings and messages carry only distances, so two atoms with similar
-    environments get near-identical tokens and no decoder can place them apart. On
-    MP-20 the per-site position loss sat at 2.60-2.64 for eighteen epochs without
-    them.
-
-    The origin must NOT be randomised per step: `canonical_site_order` keys on
-    absolute coordinates, so a random shift would change which atom occupies which
-    token and reintroduce the multi-valued flow-matching target.
     """
 
     def __init__(self, n_freq=6):
@@ -1391,14 +1200,7 @@ class FracFourier(nn.Module):
 class CrystalGNNEncoder(nn.Module):
     """Invariant message-passing GNN -> a fixed-length set of SITE tokens.
 
-    Token i of the latent set IS site i of the asymmetric unit in
-    `canonical_site_order`; unused tokens carry a learned per-index empty embedding.
-    Because the target for token i is the embedding of a DIFFERENT atom, two
-    identical tokens are paid for directly by the reconstruction loss.
-
-    A short self-attention stack over the tokens gives every token a view of the
-    whole crystal, which is what makes the cell and the space group readable off the
-    set.
+   
     """
 
     def __init__(self, num_types, hidden=128, n_layers=4, out_dim=64,
@@ -1438,14 +1240,7 @@ class CrystalGNNEncoder(nn.Module):
     def forward(self, atom_types, frac, L, mask, src, dst, offset, emask,
                 elem_feat=None, type_probs=None, site_mask=None,
                 order_frac=None, canonical=True):
-        """(tokens, keep): (B, n_sites, out_dim) and (B, n_sites) bool.
-
-        `site_mask` picks the atoms that become tokens -- the asymmetric unit
-        during training, every decoded site for the generated-structure
-        surrogate. `order_frac` supplies the coordinates used for the canonical
-        key; pass the UNAUGMENTED coordinates when the encoder input has been
-        jittered, or the ordering stops matching the supervision targets.
-        """
+        
         if type_probs is not None:
             s = type_probs @ self.embed.weight
             if self.elem_feat_dim > 0 and elem_feat is not None:
@@ -1510,13 +1305,6 @@ class CrystalGNNEncoder(nn.Module):
 
 class LatentStandardizer(nn.Module):
     """Whitens the latent with RUNNING statistics in both modes.
-
-    The original normalised with per-batch statistics during training, which
-    makes one crystal's flow-matching target depend on the other crystals that
-    happened to share its batch (B*n_sites rows for a 64-dim latent is a
-    noisy estimate). Running statistics are used for the transform in both
-    modes; only the buffer update is train-only, so train and sample agree
-    exactly.
     """
 
     def __init__(self, dim, momentum=0.01, eps=1e-5):
@@ -1536,24 +1324,7 @@ class LatentStandardizer(nn.Module):
 
     @torch.no_grad()
     def _update(self, z):
-        """Refresh the running statistics from a batch that can actually
-        produce them, and repair them if they are already unusable.
-
-        These two buffers are the only state that forward() mutates in place,
-        which makes them the one place where a transient numerical accident
-        becomes permanent. The old update committed whatever the batch gave it:
-        a single latent containing a NaN -- or merely large enough that the
-        fp32 sum of squares overflows, which happens around |z| ~ 1.8e19 --
-        wrote a non-finite mean/var, and every subsequent forward pass then
-        divided by it, in train AND eval mode, for the rest of the run. Because
-        the training loops skip non-finite losses instead of failing, the run
-        did not crash; it went quiet and kept reporting progress.
-
-        So: accumulate in float64, commit only finite statistics, and treat
-        already non-finite buffers as uninitialised so the next clean batch
-        restores them. The input to this module never depends on these buffers,
-        so that recovery path is always reachable.
-        """
+        
         flat = z.detach().reshape(-1, z.size(-1))
         if flat.numel() == 0:
             return
@@ -1589,10 +1360,6 @@ class LatentStandardizer(nn.Module):
         self.var.fill_(1.0)
         self.initialized.fill_(False)
 
-# ==============================================================================
-# 5  GENERATOR: FLOW FIELD, CONDITIONER, DECODER, AUXILIARY HEADS
-# ==============================================================================
-
 class FlowBlock(nn.Module):
     def __init__(self, dim, hidden, cond_dim, t_dim=64, heads=4):
         super().__init__()
@@ -1625,12 +1392,6 @@ class FlowBlock(nn.Module):
 
 class LatentSetFlow(nn.Module):
     """Velocity field over the latent SITE set. This is the generator.
-
-    Mechanically unchanged from the previous capsule flow; what changed is the
-    meaning of a row (one crystallographic site instead of one motif capsule)
-    and the weight put on `token_emb`. The latent set is written in a canonical
-    order, so the field has to be allowed to break the permutation symmetry of
-    the noise, and the per-index embedding is what lets it.
     """
 
     def __init__(self, dim, hidden=256, n_layers=4, cond_dim=128, t_dim=64,
@@ -1655,11 +1416,6 @@ class LatentSetFlow(nn.Module):
 
 class PropertyConditioner(nn.Module):
     """Conditioning vector for the flow: property y AND space group.
-
-    Space group is an input, not a post-hoc constraint. Without it, stage 3
-    supervises a latent rolled out from noise + scalar y against the space group of
-    whichever real crystal supplied that y, and formation energy does not determine
-    space group, so the only minimiser is collapse onto argmax p(sg | y).
 
     y and sg are dropped independently for classifier-free guidance, so the model
     learns p(z), p(z|y), p(z|sg) and p(z|y, sg).
@@ -1711,25 +1467,6 @@ class PropertyConditioner(nn.Module):
 def assign_unique_wyckoff(wk_logits, valid, nfree, occ_mask, prior=None,
                           prior_weight=0.0):
     """Pick one Wyckoff class per token, with fixed-point classes used ONCE.
-
-    Every token chooses its class independently from a masked softmax. That is
-    fine for a class with free parameters -- two tokens on Wyckoff 4e of the
-    same group are two different orbits, distinguished by their free
-    coordinate -- but it is WRONG for a class with none: a rank-0 class is a
-    single, fully determined set of points, so two tokens choosing it are two
-    atoms at literally the same fractional coordinate. Nothing downstream can
-    repair that; the coordinate head has no freedom left to separate them, and
-    the pair survives into the expanded cell as a duplicate atom. This is the
-    dominant source of the "site conflicts" the expansion pass reports.
-
-    So: tokens are served in order of confidence, each takes its highest-scoring
-    still-available class, and a class with `nfree == 0` becomes unavailable
-    once taken. A token whose every remaining option is exhausted falls back to
-    the general position, which always has free parameters and is always valid.
-
-    `prior` (230-row marginal over classes, restricted here to the batch's
-    groups) breaks ties toward classes real crystals in that group actually
-    occupy, at strength `prior_weight` in logit units.
     """
     B, M, W = wk_logits.shape
     sc = wk_logits.float()
@@ -1770,18 +1507,6 @@ def assign_unique_wyckoff(wk_logits, valid, nfree, occ_mask, prior=None,
 class SiteDecoder(nn.Module):
     """Latent site tokens -> asymmetric unit: count, Wyckoff site, position, element.
 
-    OCCUPANCY is a single monotone cut: a count head predicts n in [1, M] from the
-    pooled set and token i is occupied iff i < n. The encoder writes real sites into
-    the FIRST tokens in canonical order, so 'occupied' and 'low index' mean the same
-    thing on the reconstruction and the generative branch.
-
-    ELEMENTS are per-token, read off a self-attention stack over the whole set, so
-    composition is one joint decision rather than M independent copies of a shared
-    pooled vector.
-
-    POSITIONS are the Wyckoff-projected anchor of each token. The decoder does not
-    consume the lattice, so the cell is built AFTER decoding from the occupancy that
-    actually materialised.
     """
 
     def __init__(self, dim, num_types, n_sites=20, hidden=256, dropout=0.1,
@@ -1900,26 +1625,7 @@ class SiteDecoder(nn.Module):
     def forward(self, z, generation=False, temperature=0.0,
                 formability_mask=None, sg=None, lattice=None,
                 wyckoff_teacher=None):
-        """`wyckoff_teacher`, when given, is the (P, o) of the TRUE Wyckoff site
-        of each token, and it is what the anchor is projected onto.
-
-        This is not a convenience. The Wyckoff head chooses a site class and the
-        coordinate is then HARD-projected onto that class's affine subspace, and
-        1906 of the 2136 enumerated classes constrain at least one coordinate.
-        Measured at initialisation on a realistic mix of space groups, 44% of
-        tokens draw a rank-0 class -- a fixed point, where the anchor output is
-        discarded outright and the position head receives no gradient at all --
-        and 85% draw a class that clamps at least one axis. The position head is
-        therefore starved before it has any idea what it is doing, and the
-        Wyckoff head cannot bootstrap out of it because its own supervision is a
-        weak auxiliary term. On MP-20 that showed up as a per-site position loss
-        pinned at chance for eighteen epochs while the Wyckoff loss barely moved.
-
-        Teacher forcing during reconstruction breaks the deadlock: the geometry
-        is projected onto the CORRECT subspace, so the position head can learn,
-        while the Wyckoff head keeps being trained by `wyckoff_proj_loss`
-        against the same ground truth and is used unaided at generation time.
-        """
+       
         B, M, _ = z.shape
         h = self.feat(z)
         for blk in self.blocks:
@@ -1980,12 +1686,7 @@ class SiteDecoder(nn.Module):
             else:
                 P_geo, o_geo = P, o
 
-            # The warmup ramp is a TRAINING device: it lets the position head
-            # learn before the projection starts discarding most of its output.
-            # At generation it must not apply -- an unprojected anchor is not on
-            # the Wyckoff site the multiplicity, the cell volume and the orbit
-            # were all computed from, and the crystal that materialises then has
-            # a different atom count than the cell was sized for.
+         
             lam = 1.0 if generation else self._wyckoff_lambda()
             if lam < 1.0:
                 P_use = (1.0 - lam) * eye3.view(1, 1, 3, 3) + lam * P_geo
@@ -2003,7 +1704,6 @@ class SiteDecoder(nn.Module):
             anchor = (anchor + (torch.rand_like(anchor) - 0.5) * self.gen_jitter) % 1.0
         frac = anchor
 
-        # --- what -----------------------------------------------------------
         type_logits = self.type_head(h)
         if formability_mask is not None:
             type_logits = type_logits + formability_mask.view(1, 1, -1).to(type_logits.dtype)
@@ -2104,13 +1804,6 @@ class SpaceGroupPredictor(nn.Module):
 
 class SiteMultiplicityHead(nn.Module):
     """How many FULL-CELL atoms site i stands for, i.e. its Wyckoff multiplicity.
-
-    Replaces the old routing head, which predicted a capsule's share of the
-    routing mass and was supervised against the encoder's own routing -- a
-    target the encoder was free to move, so it carried no information about the
-    crystal. Multiplicity is a real mined quantity (`wyckoff_multiplicity` in
-    the dataset), so this head has ground truth, and the cell volume that is
-    built from it is anchored to something outside the model.
     """
 
     def __init__(self, dim, hidden=128):
@@ -2166,14 +1859,6 @@ class CoordinateRefiner(nn.Module):
 
 def _flow_mse(v_pred, v_tgt, keep, occ_weight=3.0):
     """Flow-matching MSE with occupied tokens weighted up.
-
-    n_sites has to cover the LARGEST asymmetric unit in the dataset (20 here,
-    for a max of ~20 on MP-20), but the mean asymmetric unit on MP-20 is 4.8
-    sites. Around 76% of the tokens in any given crystal are therefore the
-    learned empty embedding, and an unweighted mean spends 76% of the
-    flow-matching gradient on reproducing that constant. The tokens that carry
-    the crystal get the remaining 24%. Weighting occupied tokens by `occ_weight`
-    restores roughly even footing without changing the objective's minimiser.
     """
     err = (v_pred - v_tgt).pow(2).mean(-1)                     # (B, M)
     if keep is None or float(occ_weight) == 1.0:
@@ -2194,9 +1879,7 @@ def _rollout_step(model, z, tt, dt, solver, vel):
     k2 = vel(z + 0.5 * dt * k1, tt + 0.5 * dt)
     return z + dt * k2
 
-# ==============================================================================
-# 6  DirectCrystalFlow
-# ==============================================================================
+
 
 class DirectCrystalFlow(nn.Module):
     """Fully flow-based crystal generator.
@@ -2212,9 +1895,7 @@ class DirectCrystalFlow(nn.Module):
         super().__init__()
         self.cfg = cfg
 
-        # Plain message-passing encoder -> one latent token per crystallographic
-        # site of the asymmetric unit (canonical order, learned empty token for
-        # the unused slots). No capsules, no routing, no gate.
+      
         self.encoder = CrystalGNNEncoder(
             cfg.num_types, hidden=cfg.enc_hidden, n_layers=cfg.enc_layers,
             out_dim=cfg.sec_dim, cutoff=cfg.cutoff, num_rbf=cfg.num_rbf,
@@ -2271,10 +1952,7 @@ class DirectCrystalFlow(nn.Module):
         self.register_buffer('y_mean', torch.tensor(0.0))
         self.register_buffer('y_std', torch.tensor(1.0))
         self.register_buffer('sg_class_weights', torch.ones(230))
-        # Empirical p(sg) from the training split. Generation samples from THIS,
-        # not from the argmax of the inverse-frequency-weighted classifier
-        # (which is deliberately biased toward rare groups and must never drive
-        # the generative path).
+      
         self.register_buffer('sg_prior', torch.ones(230) / 230.0)
         self.register_buffer('_stage3_step', torch.zeros((), dtype=torch.long))
         # Element physics features, indexed by vocabulary position. Previously
@@ -2311,9 +1989,7 @@ class DirectCrystalFlow(nn.Module):
         ox_pad, ox_msk, en_lut, metal_lut = build_chemistry_tables(zs)
         self.register_buffer('ox_states_padded', ox_pad, persistent=False)
         self.register_buffer('ox_states_mask', ox_msk, persistent=False)
-        # Pauling electronegativity and the metal flag, both from SMACT, so the
-        # loss can implement the electronegativity criterion and the alloy
-        # exemption that the evaluation gate applies.
+       
         self.register_buffer('eneg_lut', en_lut, persistent=False)
         self.register_buffer('metal_lut', metal_lut, persistent=False)
         print(f"  Chemistry tables: {float(ox_msk.sum(1).mean()):.2f} oxidation "
@@ -2439,35 +2115,7 @@ class DirectCrystalFlow(nn.Module):
         return ref
 
     def _occupancy_bias(self, z, hard_keep=None, scale=6.0, sharpness=3.0):
-        """Additive attention key-bias (nn.MultiheadAttention key_padding_mask,
-        float form) suppressing attention TO slots likely to end up empty.
-
-        Capacity is `cfg.n_sites` (e.g. 20) but a typical crystal occupies a
-        handful; with no mask, every slot -- real or noise-destined-for-empty
-        -- gets full attention from every other slot, at every FlowBlock layer
-        and every ODE integration step. The encoder avoids this by masking
-        empty slots to a clean constant BEFORE attention ever runs; the flow
-        has no equivalent, so noise from the majority-empty capacity can leak
-        into and homogenize the few real tokens over the whole trajectory.
-        This is the fix.
-
-        `hard_keep` (B, M) bool: real ground-truth occupancy, available only
-        for teacher-forced single-step training (flow_losses, and stage3's
-        own `flow` term) where z1's true occupancy is known. Produces an
-        exact hard exclusion.
-
-        Otherwise (any free rollout: stage3's differentiable trajectory,
-        sample()'s generation, diagnostics()) true occupancy isn't known in
-        advance -- generating it IS the task. Falls back to a soft,
-        self-referential bias: distance from each slot's CURRENT z to the
-        empty reference above, relative to that crystal's own mean distance
-        (scale-free, no absolute threshold to calibrate). Near t=0 every slot
-        still looks like noise and sits close to the crystal's own mean
-        distance, so the bias starts close to uniform; as slots diverge
-        toward their eventual occupied/empty identity over the trajectory,
-        the bias sharpens accordingly -- self-correcting rather than a fixed
-        guess imposed up front.
-        """
+      
         if hard_keep is not None:
             return (~hard_keep.bool()).to(z.dtype) * -1e4
         ref = self._empty_ref(z.dtype, z.device)                  # (M, D)
@@ -2477,13 +2125,6 @@ class DirectCrystalFlow(nn.Module):
 
     def reconstruct(self, batch, encode_grad=True, add_noise=None):
         """Encode a real crystal and decode it again.
-
-        Shared by the encoder pretraining loss and by stage 3's reconstruction
-        anchor, so the two can never drift apart. Because the latent set is
-        ordered canonically, token i of the decoder output corresponds to site i
-        of the target, which allows the DIRECT per-site supervision returned
-        here (`tgt_types`, `tgt_frac`, `tgt_mult`) in addition to the
-        order-free chamfer / nearest-neighbour terms.
         """
         cfg = self.cfg
         at, frac, L, mask = batch['types'], batch['frac'], batch['lattice'], batch['mask']
@@ -2532,10 +2173,6 @@ class DirectCrystalFlow(nn.Module):
         pm = dec['mask'].bool()
         tm = site_mask
 
-        # Two gauges. The chamfer is order-free and its nearest-neighbour shift
-        # is well behaved, so it keeps one. The per-site term does not need one
-        # when the encoder sees absolute coordinates, and applying one there is
-        # what pinned site_pos at the random-coordinate reference.
         _gauge = str(getattr(cfg, 'site_align_gauge', 'auto')).lower()
         if _gauge == 'auto':
             _use_site_gauge = not bool(getattr(cfg, 'use_pos_features', True))
@@ -2569,12 +2206,6 @@ class DirectCrystalFlow(nn.Module):
 
     def freeze_encoder(self, freeze_property=True):
         """Freeze the encoder stack (and the property head) and mark the model pretrained.
-
-        Must be called on BOTH branches of `main()`. `load_checkpoint` restores tensors
-        but not `requires_grad`, and the `--encoder-path` resume path skips
-        `run_encoder_pretrain`, so the encoder and property head used to stay trainable
-        and joined the stage-3 optimiser: measured on one batch, 3.2e+02 of gradient into
-        the encoder and 1.2e+01 into the property head against zero when frozen.
         """
         for mod in (self.encoder, self.enc_proj, self.enc_standardizer):
             mod.eval()
@@ -2596,15 +2227,7 @@ class DirectCrystalFlow(nn.Module):
         self.property_frozen.eval()
 
     def property_from_structure(self, frac, type_probs, L, mask, sg=None):
-        """Read the property off the DECODED CRYSTAL, not off the latent.
-
-        The asymmetric unit is EXPANDED by the space group before re-encoding. The
-        encoder was trained on full cells with `site_mask` selecting the asymmetric unit,
-        so feeding it the asymmetric unit as the whole cell strips most of every atom's
-        neighbourhood. Its output was then noise, and `property_struct` -- the only term
-        that can make the decoded structure depend on y -- was backpropagating that noise:
-        the structure-read property moved 0.20 across a target range of 3.13 (spearman
-        +0.20) while the latent-read property tracked the target almost exactly.
+        """Read the property off the DECODED CRYSTAL
         """
         cfg = self.cfg
         if sg is not None and bool(getattr(cfg, 'surrogate_expand_orbits', True)):
@@ -2615,13 +2238,10 @@ class DirectCrystalFlow(nn.Module):
                 n_ops=n_ops, stochastic=False, L=L, dedup=True)
             A0 = frac.size(1)
             p_e = type_probs.repeat(1, n_ops, 1)[:, :f_e.size(1)]
-            # only the identity block (the asymmetric unit itself) becomes a
-            # token; the images are there to complete the neighbourhoods.
+           
             site_m = torch.zeros_like(m_e, dtype=torch.bool)
             site_m[:, :A0] = mask.bool()
-            # The orbit tensor is mostly padding -- see compact_by_mask. This is
-            # the single most expensive call in stage 3 and the padding is the
-            # bulk of it.
+           
             m_e, f_e, p_e, site_m = compact_by_mask(m_e, f_e, p_e, site_m)
         else:
             f_e, m_e, p_e = frac, mask.to(frac.dtype), type_probs
@@ -2886,53 +2506,6 @@ class DirectCrystalFlow(nn.Module):
                       apply_warmup=True):
         """Generative fine-tuning: roll the flow out from noise, decode, and
         grade the crystal that comes out.
-
-        TEN terms, and each one is here because nothing else covers what it
-        covers. The previous version carried twenty-two, which is not a
-        stronger objective but a weaker one: `unary`, `comp_balance`, `nelem`,
-        `type_sharp` and `composition` were five different prices on the same
-        quantity (does the cell have a sensible mix of elements?), `ncell`
-        restated `count` and `vpa`, `property_contrast` restated
-        `property_rank` at the cost of a SECOND full rollout and a second
-        structure-surrogate pass -- the single most expensive thing in the
-        step -- and `special_pos` / `orbit_type` penalised configurations that
-        the Wyckoff projection and the decode-time conflict resolver now make
-        unreachable by construction. Terms that overlap do not add signal, they
-        divide it: each one needs its own weight, the weights interact, and the
-        gradient that reaches the decoder is the sum of several partly
-        cancelling opinions about the same variable.
-
-        What remains:
-
-          flow          flow matching against the frozen encoder's latents.
-                        This is the generator. An FM flow reproduces its target
-                        distribution at any step count, which is what keeps the
-                        8-step training rollout honest about the 100-step
-                        sampling one.
-          recon         the reconstruction anchor (the stage-1 objective,
-                        unchanged) -- the decoder must keep working on real
-                        latents while it is being asked about rolled-out ones.
-          composition   cell composition against the assignment-matched real
-                        crystal, on straight-through one-hot counts. Prices
-                        arity, balance and identity at once.
-          charge        SMACT charge neutrality + electronegativity.
-          repulsion     hard-sphere overlap, including symmetry images.
-          vpa           density against the matched real crystal.
-          count         number of asymmetric-unit sites, same matching.
-          sg_align      the decoded geometry must read as the space group it
-                        was conditioned on.
-          property      frozen-critic read of y off the latent.
-          property_struct / property_rank
-                        y re-read from the generated atoms: the absolute level
-                        and the batch-wide ordering. These two are what make
-                        the conditioning move the structure rather than the
-                        latent only.
-
-        The rolled-out latent is detached before the structural decode
-        (`stage3_decode_detach`), so the validity penalties train the decoder
-        and the auxiliary heads on the flow's realised output distribution
-        without dragging the flow toward the collapsed unary cell they all
-        share a minimum at.
         """
         cfg = self.cfg
         recon_every_k = int(getattr(cfg, 'recon_every_k', 1))
@@ -2949,7 +2522,6 @@ class DirectCrystalFlow(nn.Module):
         w = cfg.weights
         sg_batch = batch['sg'].view(-1).clamp(1, 230)
 
-        # ---- flow matching term (teacher forced, one step) -------------------
         with torch.no_grad():
             z1, _keep_fm = self._encode_target(batch, add_noise=True)
         z0 = torch.randn_like(z1)
@@ -2967,11 +2539,7 @@ class DirectCrystalFlow(nn.Module):
             z1 - z0, _keep_fm,
                               float(getattr(cfg, 'flow_occ_weight', 3.0)))
 
-        # ---- rollout ---------------------------------------------------------
-        # Conditioned on BOTH y and the batch's space group, which is what makes
-        # the sg and composition supervision below a consistency check rather
-        # than a forced pairing between an unconditional sample and an
-        # arbitrary real crystal.
+      
         cond = self.conditioner(yn, B, y.device, drop_prob=0.0, training=False,
                                 sg=sg_batch, sg_drop_prob=0.0)
         cond_null = self.conditioner(None, B, y.device, sg=sg_batch,
@@ -2995,11 +2563,7 @@ class DirectCrystalFlow(nn.Module):
                 return vu + _g3 * (vc - vu)
             return vc
 
-        # The prefix of the trajectory is not differentiated, so it does not
-        # need a second-order step: rk2 costs two velocity evaluations per step
-        # and the prefix is 14 of the 16 steps at the default settings. Euler
-        # there and the accurate solver on the differentiated tail halves the
-        # flow evaluations per training step.
+     
         _pre_solver = str(getattr(cfg, 'stage3_prefix_solver', 'euler')).lower()
         for i in range(rollout_steps):
             tt = ts[i:i + 1]
@@ -3031,25 +2595,13 @@ class DirectCrystalFlow(nn.Module):
         else:
             gen_losses['recon'] = torch.zeros((), device=y.device)
 
-        # ---- conditioning ----------------------------------------------------
-        # Property off the latent. The pooling weights are detached so the only
-        # way to change the prediction is to move the latent.
+     
         y_dec, _ = self.property(z, occ.detach())
         gen_losses['property'] = (w.get('property', 1.5)
                               * float(getattr(cfg, 'stage3_property_scale', 1.5))
                               * F.smooth_l1_loss(y_dec.squeeze(-1), yn, beta=0.5))
 
-        # Property re-read from the ATOMS. One surrogate pass, used twice: for
-        # the absolute level and for the batch-wide ordering.
-        #
-        # AMORTISED. This call re-encodes the symmetry-expanded structure with
-        # gradient and is, by a wide margin, the most expensive thing in the
-        # step (profiled: 4.6 s of a 5.2 s forward at B=32, and it dominates the
-        # backward too). What it supervises -- "does y move the atoms" -- is a
-        # slow constraint on the decoder, not a per-step geometric correction,
-        # so running it every `property_every_k` steps buys back most of the
-        # cost. Validation always computes it, or the reported val loss would
-        # depend on which step it landed on.
+    
         _pk = int(max(1, getattr(cfg, 'property_every_k', 4)))
         _do_prop = (not torch.is_grad_enabled()
                     or int(self._stage3_step.item()) % _pk == 0)
@@ -3066,10 +2618,7 @@ class DirectCrystalFlow(nn.Module):
                 * F.smooth_l1_loss(y_str, yn, beta=0.5))
 
         if y_str is not None and w.get('property_rank', 0.0) > 0 and B > 1:
-            # `property_struct` alone is satisfied by a generator that ignores y
-            # and gets the MEAN right. Ranking every resolvable pair in the
-            # batch is what forces y to move the atoms, and it optimises
-            # directly for what the conditioning diagnostic measures.
+           
             yv = yn.detach()
             di = yv.unsqueeze(1) - yv.unsqueeze(0)
             dj = y_str.unsqueeze(1) - y_str.unsqueeze(0)
@@ -3079,11 +2628,6 @@ class DirectCrystalFlow(nn.Module):
             gen_losses['property_rank'] = w.get('property_rank', 2.0) * float(_pk) * (
                 pair_loss.sum() / pair_mask.sum().clamp(min=1.0))
 
-        # ---- composition, on multiplicity-weighted CELL counts ---------------
-        # The decoder emits the asymmetric unit, whose formula is not the cell
-        # formula whenever multiplicities differ (asym ABO vs cell ABO3), so
-        # every element-facing term is evaluated on cell counts. Multiplicity
-        # is the exact Wyckoff table, not a regression.
         _wm = dec.get('wyckoff_mult')
         if _wm is not None:
             cell_w = dec['mask'] * _wm.to(dec['mask'].dtype).clamp(min=1.0)
@@ -3097,10 +2641,7 @@ class DirectCrystalFlow(nn.Module):
             cell_w = dec['mask'] * _mult.clamp(min=1.0)
         n_cell = cell_w.sum(1, keepdim=True).clamp(min=1.0)
 
-        # Element-facing losses consume the STRAIGHT-THROUGH one-hot, not the
-        # raw softmax: the marginal (probs * w).sum(1) is blind to how mass is
-        # spread WITHIN a site, so a uniform two-element mixture everywhere
-        # scores a perfect composition while argmax emits a unary cell.
+        
         _probs_st = dec.get('type_probs_st', dec['type_probs'])
 
         _nops = int(max(1, getattr(cfg, 'repulsion_ops', 16)))
@@ -3126,11 +2667,7 @@ class DirectCrystalFlow(nn.Module):
 
         vpa = (torch.linalg.det(L).abs() / n_cell.squeeze(-1)).clamp(min=1e-3)
 
-        # ---- set-level supervision of the GENERATED branch -------------------
-        # Property, charge, repulsion and density are all minimised by a nearly
-        # empty unary cell, so a one-to-one assignment against the real crystals
-        # in the batch is what supplies a real target for composition, cell size
-        # and site count.
+       
         _nt = dec['type_probs'].size(-1)
         _tm_cell = batch['mask'].float()
         _true_counts = (F.one_hot(batch['types'].clamp(0, _nt - 1), _nt).float()
@@ -3141,10 +2678,7 @@ class DirectCrystalFlow(nn.Module):
                     else batch['mask'].bool())
 
         if bool(getattr(cfg, 'set_assignment', True)) and B > 1:
-            # The assignment must not contradict the conditioning: composition
-            # largely determines formation energy, so an unconstrained
-            # permutation would ask one sample for crystal j's composition AND
-            # crystal b's y under crystal b's space group.
+           
             _asg = composition_set_assignment(
                 _pred_counts.detach(), _true_counts.detach(),
                 size_weight=float(getattr(cfg, 'assign_size_weight', 0.25)),
@@ -3159,9 +2693,7 @@ class DirectCrystalFlow(nn.Module):
         else:
             _asg = torch.arange(B, device=y.device)
 
-        # reduction='sum' over the vocabulary, then mean over the batch: a plain
-        # .mean() divides the gradient reaching the two or three elements that
-        # actually occur by the vocabulary size.
+      
         _pf = _pred_counts / _pred_counts.sum(-1, keepdim=True).clamp(min=1e-6)
         _tf = _true_counts / _true_counts.sum(-1, keepdim=True).clamp(min=1e-6)
         comp_l = F.smooth_l1_loss(_pf, _tf[_asg], beta=0.05,
@@ -3177,7 +2709,7 @@ class DirectCrystalFlow(nn.Module):
         count_l = F.smooth_l1_loss(dec['n_sites_soft'], _true_n_site, beta=1.0)
         gen_losses['count'] = w.get('count', 1.0) * count_l
 
-        # ---- does the geometry read as the conditioned space group? ----------
+        
         sg_true = sg_batch - 1
         _sg_detach = not bool(getattr(cfg, 'sg_pos_grad', True))
         sg_pos = self.sg_pos_encoder(self._sg_pos_feat(
@@ -3187,11 +2719,7 @@ class DirectCrystalFlow(nn.Module):
         gen_losses['sg_align'] = w.get('sg_align', 1.0) * sg_align
 
         gen = sum(gen_losses.values())
-        # Ramp the generative terms in: stage 3 starts against a decoder that
-        # has only ever seen encoder latents, and set-level objectives it cannot
-        # yet satisfy push it to a uniform softmax within a few epochs. The ramp
-        # is a TRAINING schedule -- validate() passes apply_warmup=False so that
-        # early and late validation losses stay comparable.
+      
         _gw = int(getattr(cfg, 'stage3_gen_warmup', 0))
         if _gw > 0 and apply_warmup:
             gen_weight = float(gen_weight) * min(
@@ -3225,8 +2753,7 @@ class DirectCrystalFlow(nn.Module):
             if dec.get('wyckoff_mult') is not None:
                 comps['mult_gen'] = float(
                     (cell_w.sum() / dec['mask'].sum().clamp(min=1.0)))
-        # RAW, not weighted, so the stage-1 and stage-3 metric files can be
-        # compared directly.
+        
         for _k in ('recon', 'composition', 'lattice', 'wyckoff',
                    'property_struct', 'mult', 'site_type', 'site_pos',
                    'recon_count', 'wyckoff_ce', 'property_rank'):
@@ -3244,25 +2771,6 @@ class DirectCrystalFlow(nn.Module):
     def _build_cell(self, z, dec, sg_pred, refine=True, correct_density=True,
                     band='train'):
         """Cell construction AFTER decoding.
-
-        The decoder no longer takes the lattice, so the volume can be built from
-        the sites that actually exist: V = sum_i occ_i * mult_i * v_i. One
-        optional correction re-measures the multiplicity from the decoded
-        coordinates under sg and rescales the cell to hold the per-atom volume
-        fixed. No re-decode and no fixed-point loop is needed.
-
-        `band` selects which density clamp applies.
-
-          'train'  [vpa_floor, vpa_ceiling]. A narrow band is what keeps the
-                   geometry terms meaningful while the lattice head is out of
-                   distribution on rolled-out latents.
-          'sample' [sample_vpa_floor, sample_vpa_ceiling], deliberately WIDER
-                   than the window `structural_validity` accepts. With the
-                   training band applied at sampling, the validity check's
-                   `vpa_ok` component is true BY CONSTRUCTION -- the clamp
-                   guarantees the property the metric is testing for -- and
-                   every sampled cell comes out at exactly the floor. Widening
-                   the sampling band lets the metric actually fail.
         """
         cfg = self.cfg
         if str(band) == 'sample':
@@ -3271,11 +2779,7 @@ class DirectCrystalFlow(nn.Module):
         else:
             vf = float(getattr(cfg, 'vpa_floor', 10.0))
             vc = float(getattr(cfg, 'vpa_ceiling', 60.0))
-        # Multiplicity: the exact table when the decoder knows which Wyckoff
-        # class each token took, the learned head only as a fallback. The head
-        # was approximating a quantity the group determines outright, and its
-        # error went straight into the cell volume (V = sum occ_i * mult_i * v_i)
-        # and from there into every density-dependent term.
+       
         wm = dec.get('wyckoff_mult')
         if wm is not None and bool(getattr(cfg, 'use_wyckoff_multiplicity', True)):
             mult_pred = wm.to(dec['occ_soft'].dtype)
@@ -3284,24 +2788,10 @@ class DirectCrystalFlow(nn.Module):
         w_site = dec['occ_soft'] * mult_pred
         n_full = w_site.sum(1, keepdim=True).clamp(min=1.0)
         L, V, _ = self.lattice(z, w_site)
-        # Both ends of the band, not just the floor. The lattice head is
-        # trained on encoder latents and is out of distribution on rolled-out
-        # ones, e.g. VPA 107 against a reference 24.9, swinging 51 -> 270 -> 25
-        # across epochs. A structure at 150 A^3/atom is not a crystal, and
-        # every downstream geometric term (repulsion, connectivity, the
-        # distance gate) is meaningless there. Straight-through so the clamp
-        # does not zero out the gradient exactly where the lattice head most
-        # needs correcting.
+       
         V = V.clamp(min=1e-3)
         V = _clamp_st(V, n_full * vf, n_full * vc)
         L = self._finalize_lattice(L, V, sg_pred)
-
-        # The density correction exists to re-measure the atom count from the
-        # decoded coordinates. When the multiplicity came from the Wyckoff table
-        # it IS the count -- n_cell == n_full identically -- so the correction is
-        # an expensive no-op: `orbit_multiplicity` runs a sequential pass over up
-        # to 192 group operations, which on the profiled batch cost more than the
-        # entire decoder forward it is correcting.
         if correct_density and wm is None:
             mult = orbit_multiplicity(
                 dec['frac'], dec['mask'], sg_pred,
@@ -3429,7 +2919,6 @@ class DirectCrystalFlow(nn.Module):
                                                 target_sg=sg_cond, refine=False,
                                                 t=(i + 1) / steps, vel=vel))
 
-        # ---- decode ----------------------------------------------------------
         sg_logits_0, sg_coarse_pred = self._sg_first_pass(z)
 
         sg_pred = sg_coarse_pred if sg_cond is None else sg_cond.to(z.device)
@@ -3449,23 +2938,6 @@ class DirectCrystalFlow(nn.Module):
                 snap_tol=float(getattr(cfg, 'sym_snap_tol', SYM_SNAP_TOL)))
         n_cell = (dec['mask'] * mult.clamp(min=1.0)).sum(1, keepdim=True).clamp(min=1.0)
 
-        # ---- conflict resolution, on the asymmetric unit ---------------------
-        # Everything downstream (multiplicity, cell volume, composition,
-        # expansion) must see the FINAL site set, so this runs before any of it
-        # is recomputed. Relocation happens inside each site's own Wyckoff
-        # subspace, so the space group survives it; a site that still cannot be
-        # placed is removed whole.
-        #
-        # ORDERING MATTERS. The resolver measures Angstrom distances, so it has
-        # to measure them in the cell that is actually emitted. `_build_cell`
-        # sized the volume against `orbit_multiplicity`'s merged count while
-        # everything from here on uses the exact Wyckoff count, and
-        # `expand_generated` then rescaled the volume a third time -- so
-        # distances the resolver had just certified were being shrunk
-        # afterwards, which is how overlapping pairs survived a pass whose
-        # whole job was to remove them. The cell is fixed to the site set
-        # FIRST, and re-fixed whenever a drop changes that set, until the two
-        # agree.
         _vf = float(getattr(cfg, 'sample_vpa_floor', 3.0))
         _vc = float(getattr(cfg, 'sample_vpa_ceiling', 120.0))
         _vpa0 = (V.view(-1) / n_cell.view(-1).clamp(min=1.0)).clamp(_vf, _vc)
@@ -3487,15 +2959,7 @@ class DirectCrystalFlow(nn.Module):
                 max_atoms=int(getattr(cfg, 'expand_max_atoms', 400)),
                 seed=_pass)
             _dropped_b = (_m0.sum(1) - dec['mask'].sum(1))
-            # WHICH OF THE TWO IS WRONG? When sites will not fit, the cell is
-            # the thing to doubt, not the atoms. The atom set comes out of the
-            # generative path; the volume comes from a lattice head that is out
-            # of distribution on rolled-out latents and, when it underestimates,
-            # the clamp parks it on the density floor -- where no arrangement of
-            # anything avoids overlap. So a pass that had to drop sites is
-            # retried at a lower density first, and sites are only given up when
-            # inflating the cell has stopped helping or would leave the density
-            # band altogether.
+            
             if (_dropped_b > 0).any() and _pass + 1 < _tries:
                 _grow = float(getattr(cfg, 'resolve_inflate', 1.6))
                 _next = torch.where(_dropped_b > 0, _vpa0 * _grow, _vpa0)
@@ -3503,10 +2967,7 @@ class DirectCrystalFlow(nn.Module):
                     _vpa0 = _next.clamp(_vf, _vc)
                     continue
             break
-        # The cell that was just certified is the cell that is emitted: the
-        # realised multiplicities only change the REPORTED density, they do not
-        # resize the box (that would move every distance the resolver just
-        # checked). `rescale_volume_after_expand` is off for the same reason.
+        
         mult = _res['mult'] * dec['mask']
         n_cell = (dec['mask'] * mult.clamp(min=1.0)).sum(1, keepdim=True).clamp(min=1.0)
         V = torch.linalg.det(L).abs().clamp(min=1e-3).view(-1, 1)
@@ -3567,9 +3028,7 @@ class DirectCrystalFlow(nn.Module):
         out['n_sites_dropped'] = _res['n_dropped']
 
         if expand_orbits:
-            # higher = kept first if max_atoms forces a truncation; the same
-            # ordering resolve_site_conflicts used (special positions first,
-            # then confidence)
+          
             _nf_pri = (dec.get('wyckoff_nfree') if dec.get('wyckoff_nfree')
                        is not None else torch.zeros_like(dec['mask']))
             _pri = dec['type_probs'].detach().amax(-1) - 4.0 * _nf_pri
@@ -3596,9 +3055,7 @@ class DirectCrystalFlow(nn.Module):
 
         return out
 
-# ==============================================================================
-# 7  LOSSES
-# ==============================================================================
+
 
 def align_pred_frac(pf, tf, L, pm, tm, iters=3, return_shift=False):
     """Global fractional shift aligning the predicted set onto the true set.
@@ -3630,13 +3087,6 @@ def align_pred_frac(pf, tf, L, pm, tm, iters=3, return_shift=False):
 
 def canonical_align_shift(pred_frac, tgt_frac, keep, iters=3):
     """Global fractional shift s with (pred_i + s) ~ tgt_i, from correspondence.
-
-    TRUE circular mean (unit-phasor average). The arithmetic mean of wrapped
-    residuals is discontinuous -- one site crossing +-0.5 moves it by ~1/n, a 0.17-0.5
-    jump of the whole target for MP-20's 3-6 site asymmetric units. It moved 0.10-0.19
-    fractional units per optimiser step and the position head could never converge
-    against it: memorising four crystals left site_pos at the random reference
-    (1.2-1.7) where the same run without the gauge reached 0.02. Detached.
     """
     with torch.no_grad():
         w = keep.to(pred_frac.dtype).unsqueeze(-1)
@@ -3713,15 +3163,6 @@ def _canonical_site_targets(batch, n_sites, decode_asym=True):
 
 def site_alignment_losses(dec, pf, keep, tgt_types, tgt_frac, L):
     """DIRECT per-token supervision, slot i against true site i.
-
-    This is what the canonical ordering buys and what the capsule model could
-    not have: chamfer and the nearest-neighbour type loss are both order-free,
-    so "every site on the most common element" sits at a shallow minimum of
-    both. Here token 3 has to be the element and the position of site 3, so a
-    unary cell is paid for at every token that should have carried a different
-    element.
-
-    `pf` must already carry the origin gauge from `canonical_align_shift`.
     """
     kf = keep.to(pf.dtype)
     denom = kf.sum().clamp(min=1.0)
@@ -3740,12 +3181,6 @@ def site_alignment_losses(dec, pf, keep, tgt_types, tgt_frac, L):
 def periodic_chamfer(pf, tf, L, pm, tm, pw=None, cover_all_slots=True):
     """Correspondence-aware structural distance (nearest-image chamfer).
 
-      coverage : every true atom must have a predicted SITE near it, scored over
-                 ALL slots including ones occupancy has not switched on, so the
-                 coordinate head learns placement independently of the count.
-      precision: an occupied site far from any true atom costs in ABSOLUTE terms
-                 (normalised by the true count, not by the occupancy mass), so
-                 down-weighting a bad site no longer hides it.
     """
     pf = pf % 1.0
     tf = tf % 1.0
@@ -3771,13 +3206,6 @@ def periodic_chamfer(pf, tf, L, pm, tm, pw=None, cover_all_slots=True):
 def type_loss_nn(pred_logits, true_types, pf, tf, L, pm, tm, formability_mask=None,
                  reverse_weight=1.0):
     """Bidirectional nearest-neighbour type cross-entropy.
-
-    pred -> true alone is not a bijection: many predicted atoms may claim the same
-    true atom and a true atom with no predicted neighbour costs nothing, so 'put every
-    site on the most common element' is a legitimate minimiser. The reverse direction
-    closes it. Applied to SURPLUS SITES ONLY -- on slots that already have an exact
-    canonical target its assignment is near random while coordinates are poor, and its
-    minimiser is the per-cell marginal.
     """
     pf = pf % 1.0
     tf = tf % 1.0
@@ -3789,7 +3217,7 @@ def type_loss_nn(pred_logits, true_types, pf, tf, L, pm, tm, formability_mask=No
     else:
         _finite = None
 
-    # ---- pred -> true: each predicted atom labelled by its nearest true atom
+
     d_pt = d.masked_fill(~tm.unsqueeze(1), D_CEIL)
     nn_idx = d_pt.argmin(2)
     labels = torch.gather(true_types, 1, nn_idx)
@@ -3808,7 +3236,7 @@ def type_loss_nn(pred_logits, true_types, pf, tf, L, pm, tm, formability_mask=No
     if reverse_weight <= 0:
         return fwd
 
-    # ---- true -> pred: each true atom supervises its nearest predicted atom
+  
     d_tp = d.masked_fill(~pm.unsqueeze(2), D_CEIL)
     nn_p = d_tp.argmin(1)                                  # (B, T) -> pred idx
     C = pred_logits.size(-1)
@@ -3833,12 +3261,6 @@ def type_loss_nn(pred_logits, true_types, pf, tf, L, pm, tm, formability_mask=No
 def wyckoff_proj_loss(site_P, site_o, pf, tf, true_P, true_o, L, pm, tm, K,
                       shift=None):
     """Supervise the decoder's Wyckoff mixture against the mined site projectors.
-
-    ORIGIN GAUGE. `pf` has been moved by align_pred_frac's detached shift s while
-    `site_o` is produced in the decoder's unshifted frame and `true_o` is origin-fixed
-    in the crystal's. Comparing them directly puts a permanent floor of |s| on the
-    offset term. Since the site is {P v + o} with P o = 0, translating by s sends
-    o -> o + (I - P) s, which is applied here.
     """
     if true_P is None or true_o is None:
         return site_P.new_zeros(())
@@ -3866,11 +3288,6 @@ def wyckoff_proj_loss(site_P, site_o, pf, tf, true_P, true_o, L, pm, tm, K,
 
 def wyckoff_class_ce(wk_logits, tgt_wyck, sg, valid_lut):
     """Cross-entropy on the Wyckoff class, with unrepresentable targets ignored.
-
-    `SiteDecoder` masks classes invalid for the sample's space group to -1e4 before
-    the softmax, so a target the table does not offer scores ~1e4 and its gradient is
-    noise. Such targets are dropped and the surviving fraction returned; coverage
-    well below 1.0 means the codebook and the annotations disagree.
     """
     if wk_logits is None or tgt_wyck is None:
         return None, 0.0
@@ -3918,14 +3335,7 @@ def hardcore_repulsion(frac, L, mask, types, radii_lut, scale=0.70, n_images=2,
     rb = radii_lut[tb.clamp(min=0, max=radii_lut.size(0) - 1)]
     thr = scale * (r.unsqueeze(2) + rb.unsqueeze(1))
 
-    # Bounded and dimensionless: relu(1 - d/thr)^2 lies in [0, 1] per pair,
-    # where the old relu(thr - d)^2 was in Angstrom^2 and reached ~3.6 for a
-    # fully coincident heavy-atom pair. Measured per-term gradient into the
-    # decoder on one stage-3 step, repulsion was ~80,712 against ~15,878 for
-    # the reconstruction anchor -- about 75% of the entire decoder signal, and
-    # mostly an artefact of the volume clamp forcing a cell too small to hold
-    # its atoms. Bounding the per-pair term keeps the barrier without letting
-    # a handful of coincident pairs set the scale of the whole objective.
+    
     viol = F.relu(1.0 - dist / thr.clamp(min=1e-6)) ** 2
 
     per_b_atoms = mask.float().sum(-1).clamp(min=1.0)
@@ -3955,30 +3365,6 @@ def charge_neutrality_loss(probs, mask, ox_states_padded, ox_states_mask,
                            eneg_tau=0.5):
     """Differentiable relaxation of the FULL SMACT screen, not just charge.
 
-    The published gate this model is measured against (CDVAE's `smact_validity`,
-    reproduced exactly in `composition_validity`) is a conjunction of three
-    things:
-
-      1. an integer oxidation assignment exists with sum(count_i * ox_i) == 0;
-      2. that assignment passes the Pauling electronegativity test -- no cation
-         may be at least as electronegative as any anion;
-      3. unary compositions and all-metal alloys pass unconditionally.
-
-    Components, all differentiable in `probs`:
-
-      feas  hinge on the achievable net-charge interval containing zero.
-      neut  expected squared net charge under a soft assignment of one
-            oxidation state per element, annealed by a short fixed-point loop.
-      eneg  with o_bar_e the soft oxidation state of element e, pair (i, j) is
-            a cation/anion pair with weight s(o_bar_i) * s(-o_bar_j) and is
-            charged relu(EN_i - EN_j) -- a smooth surrogate for SMACT's
-            `eneg_states_test`.
-
-    `exempt_unary` and `include_alloys` gate the charge terms off exactly where
-    SMACT passes unconditionally, so the loss and the metric agree. Suppressing
-    unary cells is the job of the `composition` term, not this one --
-    MP-20 being multi-element is a fact about the data, not a charge-balance
-    fact.
     """
     if probs.dim() == 3:
         c = (probs * mask.unsqueeze(-1)).sum(1)
@@ -3993,14 +3379,6 @@ def charge_neutrality_loss(probs, mask, ox_states_padded, ox_states_mask,
     ox_min = ox.masked_fill(~valid, big).amin(-1).squeeze(0)
     ox_max = ox.masked_fill(~valid, -big).amax(-1).squeeze(0)
 
-    # SCALE-FREE. Charge balance is a property of the composition RATIO --
-    # sum(k * count_i * ox_i) = 0 for any k > 0 -- so the whole screen runs on
-    # normalised counts. Running it on raw multiplicity-weighted counts (which
-    # reach ~260 for a general position in a cubic group) puts the annealing
-    # loop's logits, -(residual^2)/tau with tau = 0.1, in the tens of millions,
-    # compounded through `iters` fixed-point steps, and produces a non-finite
-    # gradient on a small but real fraction of batches. `feas`/`neut` are
-    # unchanged in value since they were already divided by n / n^2.
     cf = c / n.unsqueeze(-1).clamp(min=1e-6)
 
     lo = (cf * ox_min.view(1, -1)).sum(-1)
@@ -4021,7 +3399,6 @@ def charge_neutrality_loss(probs, mask, ox_states_padded, ox_states_mask,
     var = (a * (ox - o_bar.unsqueeze(-1)) ** 2).sum(-1)
     neut = (cf * o_bar).sum(-1) ** 2 + (cf ** 2 * var).sum(-1)
 
-    # ---- electronegativity (SMACT's second criterion) ---------------------
     if eneg_lut is not None and w_eneg > 0:
         en = eneg_lut.view(1, -1).to(c.dtype)
         cn = cf
@@ -4033,7 +3410,6 @@ def charge_neutrality_loss(probs, mask, ox_states_padded, ox_states_mask,
     else:
         eneg = torch.zeros_like(feas)
 
-    # ---- exemptions, matching smact_validity ------------------------------
     gate = torch.ones_like(feas)
     present = 1.0 - torch.exp(-c.clamp(min=0.0))              # soft 1[count > 0]
     n_elem = present.sum(-1)
@@ -4042,13 +3418,7 @@ def charge_neutrality_loss(probs, mask, ox_states_padded, ox_states_mask,
     if include_alloys and metal_lut is not None:
         nonmetal = (c * (1.0 - metal_lut.view(1, -1).to(c.dtype))).sum(-1)
         gate = gate * (1.0 - torch.exp(-nonmetal.clamp(min=0.0)))
-    # DETACHED. `gate` is a differentiable function of `probs` through
-    # n_elem, so leaving it attached made "shed an element" a way to switch
-    # the charge loss off entirely -- an infeasible binary composition scores
-    # ~1.88 while the unary version of the same cell scores exactly 0.0, a
-    # large reward for collapsing to one element at weights['charge'] = 2.0.
-    # The exemption should decide WHETHER a composition is charged, not
-    # supply a gradient toward being exempt.
+   
     gate = gate.detach()
     feas = feas * gate
     neut = neut * gate
@@ -4096,22 +3466,6 @@ def composition_set_assignment(pred_counts, true_counts, size_weight=0.25,
                                sg_penalty=10.0):
     """Match each GENERATED crystal to a distinct REAL crystal in the batch.
 
-    Supervising composition per sample against "whichever real crystal supplied
-    y" forces the flow to be deterministic given (y, sg). Supervising it against
-    the batch-MARGINAL element histogram is satisfied perfectly by a model that
-    emits pure-Fe, pure-O and pure-Si cells in the right proportions, which is
-    precisely the observed failure mode: the marginal is right while every
-    individual formula is unary.
-
-    A minimum-cost one-to-one assignment sits between the two. It asks the
-    generated SET to match the real SET -- every generated crystal has to look
-    like some real crystal, and collectively the multiset has to line up -- so
-    diversity survives but "all cells unary" is no longer a minimiser. This is
-    the standard set-prediction objective (Hungarian matching), computed on
-    detached values and re-solved every step.
-
-    pred_counts / true_counts: (B, C) element counts per unit cell.
-    Returns idx (B,) with generated b supervised by real crystal idx[b].
     """
     pf = pred_counts / pred_counts.sum(-1, keepdim=True).clamp(min=1e-6)
     tf = true_counts / true_counts.sum(-1, keepdim=True).clamp(min=1e-6)
@@ -4120,13 +3474,7 @@ def composition_set_assignment(pred_counts, true_counts, size_weight=0.25,
         pn = torch.log(pred_counts.sum(-1).clamp(min=1.0))
         tn = torch.log(true_counts.sum(-1).clamp(min=1.0))
         cost = cost + float(size_weight) * (pn.view(-1, 1) - tn.view(1, -1)).abs()
-    # Sample b was generated under (y_b, sg_b). Charge the assignment for
-    # moving away from that pairing, so the matching can still avoid the
-    # unary minimiser without contradicting the conditioning it is supervised
-    # on elsewhere in the same loss (property / property_struct / sg_align):
-    # otherwise one sample can be told to have crystal j's composition AND
-    # crystal b's formation energy under crystal b's space group, and
-    # composition largely determines formation energy.
+    
     if cond_y is not None and float(y_weight) > 0:
         cy = cond_y.view(-1).to(cost.dtype)
         cost = cost + float(y_weight) * (cy.view(-1, 1) - cy.view(1, -1)).abs()
@@ -4136,9 +3484,7 @@ def composition_set_assignment(pred_counts, true_counts, size_weight=0.25,
     idx = _linear_sum_assignment(cost.detach().float().cpu().numpy())
     return torch.as_tensor(idx, dtype=torch.long, device=pred_counts.device)
 
-# ==============================================================================
-# 8  DATA: RECORDS, DATASET, COLLATION
-# ==============================================================================
+
 
 class Graph:
     def __init__(self, gd):
@@ -4343,14 +3689,7 @@ class MultiFileGraphDataset(Dataset):
         self._check_asymmetric_unit()
 
     def _check_asymmetric_unit(self):
-        """Catch the two silent dataset failures that look like model bugs.
-
-        (1) `asym_unit_mask` missing -> it defaults to all-ones, the decoder is
-            trained to emit the FULL cell, and expand_generated then multiplies
-            every atom by |G| at sample time.
-        (2) asymmetric units larger than n_sites, which the decoder cannot
-            represent at all, so their chamfer error is irreducible.
-        """
+       
         n_asym, n_full, missing = [], [], 0
         for g in self.graph_data:
             if not getattr(g, 'has_asym_unit_mask', False):
@@ -4683,9 +4022,7 @@ def _asym_unit_mask_from_batch(batch, atom_mask):
 
     return atom_mask
 
-# ==============================================================================
-# 9  TRAINING
-# ==============================================================================
+
 
 def _cosine_lr(opt, base, ep, total, warmup=0, min_frac=0.05):
     if warmup and ep < warmup:
@@ -4694,11 +4031,7 @@ def _cosine_lr(opt, base, ep, total, warmup=0, min_frac=0.05):
         prog = (ep - warmup) / max(1, total - warmup - 1)
         prog = min(1.0, max(0.0, prog))
         frac = min_frac + 0.5 * (1 - min_frac) * (1 + math.cos(math.pi * prog))
-    # Scale each group by ITS OWN initial lr, not by a shared absolute value.
-    # Stage 3 uses two param groups (generator vs decoder) at different lrs
-    # specifically because their gradient magnitudes differ by ~94x; a
-    # scheduler that overwrites every group with the same `lr` each epoch
-    # would silently collapse that ratio back to 1:1 on the very first call.
+   .
     for g in opt.param_groups:
         if '_base_lr' not in g:
             g['_base_lr'] = g['lr']
@@ -4708,11 +4041,6 @@ def _cosine_lr(opt, base, ep, total, warmup=0, min_frac=0.05):
 def _warmup_cosine_lr(opt, base, step, total_steps, warmup_steps=0, min_frac=0.05):
     """Per-STEP linear warmup then cosine decay, applied to every param group by
     ITS OWN base lr (stage 3's two groups sit at different lrs on purpose).
-
-    Stage 3 diverged in part because generative fine-tuning began at full lr
-    against heads that had only ever seen encoder latents; a per-epoch cosine is
-    too coarse to protect the first few hundred steps. This ramps the lr up over
-    `warmup_steps` optimiser steps and then decays it smoothly to `min_frac`.
     """
     warmup_steps = int(max(0, warmup_steps))
     if warmup_steps and step < warmup_steps:
@@ -4770,13 +4098,6 @@ def load_checkpoint(path, model, map_location='cpu', strict=True):
 
 def pretrain_encoder_losses(model, batch):
     """Autoencoder objective for the GNN encoder, site decoder and structural heads.
-
-    Two kinds of structural supervision run side by side: order-free (chamfer, and
-    the nearest-neighbour type loss on surplus slots) which stays meaningful when the
-    site count is wrong, and per-token (site_type / site_pos) comparing decoder token
-    i against true site i. The second only exists because the latent set is
-    canonically ordered, and it is what makes 'one element everywhere' expensive
-    rather than merely suboptimal.
     """
     cfg = model.cfg
     frac, L = batch['frac'], batch['lattice']
@@ -4877,12 +4198,7 @@ def pretrain_encoder_losses(model, batch):
     return total, {k: float(v.detach()) for k, v in losses.items()}
 
 def nonfinite_state(model, limit=12):
-    """Names of the parameters and buffers that are no longer finite.
-
-    Used by the training loops to say WHICH tensor died instead of reporting a
-    row of zeros. Buffers are included because the model carries state that
-    gradient clipping cannot protect (see LatentStandardizer).
-    """
+   
     bad_p, bad_b = [], []
     with torch.no_grad():
         for n, p in model.named_parameters():
@@ -5260,16 +4576,7 @@ _S3_CSV_FIELDS = [
 ]
 
 def profile_stage3_step(model, batch, rollout_steps=16, repeats=3, device='cpu'):
-    """Where a stage-3 step actually spends its time, on THIS machine.
-
-    Relative costs do not transfer between devices: the padded message tensors
-    dominate on a bandwidth-bound CPU, while a sequential pass over 192 group
-    operations costs almost nothing there and a great deal on a GPU, where it
-    is ~1500 dependent kernel launches. So the numbers below are worth more
-    than any general claim about which term is expensive -- run it before
-    tuning `property_every_k`, `stage3_steps`, `repulsion_ops` or
-    `recon_every_k`, not after.
-    """
+   
     import time as _time
 
     def _sync():
@@ -5369,18 +4676,6 @@ def run_stage3_finetune(model, train_loader, val_loader=None, epochs=60, lr=3e-5
     """Generative fine-tuning via model.stage3_losses -- rollout the flow through
     the decoder and train lattice/sg/sg_coarse/property/decoder(Wyckoff) against
     the resulting structure, not just against a single teacher-forced step.
-
-    `rollout_steps` (the differentiable training trajectory, default 8) is far
-    shallower than `sample()`'s default 100-step generation trajectory --
-    backpropagating through 100 steps is not tractable, so every loss term
-    here is only ever calibrated against an 8-step
-    proxy. Whatever collapse tendency compounds over the trajectory gets far
-    more opportunity to do so at 100 steps than the training signal ever
-    sees or corrects against. `full_depth_diag_every` (0 disables) runs a
-    NO-GRAD model.diagnostics() at `full_depth_diag_steps` every N epochs on
-    one validation batch, so the gap between what training is optimizing and
-    what generation actually does stays visible in the log without paying
-    the cost of full-depth backprop.
     """
     model.to(device)
     if not bool(model._encoder_pretrained):
@@ -5388,12 +4683,6 @@ def run_stage3_finetune(model, train_loader, val_loader=None, epochs=60, lr=3e-5
             "model._encoder_pretrained is False -- run_encoder_pretrain(model, "
             "train_loader, ...) must be called before run_stage3_finetune().")
 
-
-    # Two parameter groups. Measured on one stage-3 step with the default
-    # weights, gradient mass into the decoder is ~94x the flow's (83,404 vs
-    # 892), of which repulsion alone is ~75%. A single lr is therefore set by
-    # whatever keeps the decoder stable, and the generator -- the thing stage 3
-    # exists to improve -- barely moves.
     _dec_scale = float(getattr(model.cfg, 'stage3_decoder_lr_scale', 0.25))
     _gen_pref = ('flow.', 'conditioner.')
     gen_p = [p for n, p in model.named_parameters()
@@ -5462,10 +4751,7 @@ def run_stage3_finetune(model, train_loader, val_loader=None, epochs=60, lr=3e-5
                 comp_acc[k] = comp_acc.get(k, 0.0) + v
             if hasattr(bar, 'set_postfix'):
                 bar.set_postfix(loss=f"{sum(tl)/len(tl):.4f}", lr=f"{cur_lr:.1e}")
-        # A skipped step is a step the optimiser never took. Averaging over the
-        # survivors hides that: an epoch in which EVERY batch produced a
-        # non-finite loss or gradient used to print `train 0.0000` with an empty
-        # component dict and carry on, having changed nothing.
+        
         n_done = len(tl)
         if n_skip:
             _data_warn(
@@ -5523,25 +4809,9 @@ def run_stage3_finetune(model, train_loader, val_loader=None, epochs=60, lr=3e-5
         load_checkpoint(ckpt, model)
     return model, history
 
-# ==============================================================================
-# 10  SAMPLE-TIME POST-PROCESSING AND VALIDITY METRICS
-# ==============================================================================
 
 def _site_priority(nfree, conf, idx):
     """Sort key deciding which of two conflicting sites keeps its place.
-
-    1. FEWER FREE PARAMETERS FIRST. A site on a fixed point cannot be moved
-       without leaving its Wyckoff class -- its coordinate is the class. A
-       general-position site can be slid anywhere in the cell and still be the
-       same class, so it is the one that should give way. Resolving the other
-       way round destroys the special position (and with it the space group
-       the crystal was conditioned on) to save a site that did not need saving.
-    2. HIGHER CONFIDENCE NEXT: occupancy x element probability x Wyckoff
-       probability. Between two equally movable sites, keep the one the
-       decoder is more certain about.
-    3. LOWER TOKEN INDEX LAST. The encoder writes sites into the token set in
-       canonical order, so a low index is the more structurally significant
-       site, and the tie-break is deterministic.
     """
     return (int(nfree), -float(conf), int(idx))
 
@@ -5551,38 +4821,6 @@ def resolve_site_conflicts(dec, sg, L, radii_lut, min_dist=0.75,
                            overlap_scale=0.5, n_relocate=32, snap_tol=SYM_SNAP_TOL,
                            max_atoms=None, seed=0):
     """Make the decoded asymmetric unit expand to a conflict-free crystal.
-
-    THE PROBLEM. The decoder emits one token per asymmetric-unit site and the
-    space group then replicates each site into its orbit. Two tokens that end
-    up close together are therefore not one clash but |G| of them, and two
-    tokens on the same fixed-point Wyckoff class are the SAME atom twice. The
-    old code discovered this only after expansion and dealt with it by dropping
-    the individual images that clashed -- which leaves a set of atoms that is no
-    longer closed under the group, i.e. not a crystal in the space group it
-    claims. That is why `sg_selfagree` sat near 0.35 while the expansion pass
-    reported tens of "site conflicts" per batch of 32.
-
-    THE FIX, applied HERE, on the asymmetric unit, before anything is expanded:
-
-      * sites are considered in the priority order above;
-      * a site whose orbit comes closer than the hard-sphere threshold to an
-        already-accepted orbit (or to its own images) is first RELOCATED WITHIN
-        ITS OWN WYCKOFF SUBSPACE -- f = P u + o for a new u, which changes the
-        free coordinates and nothing else, so the site symmetry, the class and
-        the multiplicity are all preserved;
-      * only if no relocation clears the threshold is the site dropped, and
-        then the WHOLE site is dropped, never part of an orbit.
-
-    The result is an asymmetric unit whose orbits are pairwise disjoint at the
-    hard-sphere threshold, so `expand_generated` has nothing left to repair and
-    the emitted cell is exactly closed under the group. The threshold is the
-    same one `structural_validity` scores with,
-    max(min_dist, overlap_scale * (r_i + r_j)), so what is enforced is the
-    quantity that is measured.
-
-    Mutates `dec['frac']` / `dec['mask']` in place and returns a stats dict;
-    the per-site orbits it accepted are returned as well so the expansion pass
-    can reuse them instead of recomputing (and possibly re-deriving) them.
     """
     frac = dec['frac']
     mask = dec['mask']
@@ -5610,13 +4848,7 @@ def resolve_site_conflicts(dec, sg, L, radii_lut, min_dist=0.75,
     rng = np.random.default_rng(int(seed))
     n_reloc = n_drop = n_conf = 0
     all_orbits = []
-    # Realised multiplicity: the number of atoms each site ACTUALLY contributes
-    # to the cell. The Wyckoff table gives this exactly for a point that sits on
-    # its class and nowhere more symmetric, but a free coordinate can land on a
-    # higher-symmetry value by accident, in which case the orbit is shorter than
-    # the class says. Sizing the cell from the table and then emitting the real
-    # orbit is how a cell ends up holding fewer atoms than its volume was
-    # computed for, so the count that leaves here is the one that was built.
+   
     mult_out = np.zeros((B, M), dtype=np.float32)
 
     for b in range(B):
@@ -5694,10 +4926,6 @@ def resolve_site_conflicts(dec, sg, L, radii_lut, min_dist=0.75,
             elif best_s < 0.0:
                 n_conf += 1
 
-            # A crystal with no atoms at all is worse than a crystal with one
-            # imperfect site: it carries no composition, no space group and no
-            # property, and every metric downstream reads it as a failure. The
-            # highest-priority site is therefore always kept.
             _first = (n_acc_atoms == 0)
             if best_s < 0.0 and not _first:
                 m_np[b, i] = False
@@ -5726,15 +4954,7 @@ def resolve_site_conflicts(dec, sg, L, radii_lut, min_dist=0.75,
 
 def reconcile_symmetry_equivalent_types(out, sg_pred, snap_tol=SYM_SNAP_TOL,
                                         clash_tol_sq=1e-4):
-    """Force symmetry-equivalent asymmetric-unit sites to share one element.
-
-    Vectorised: all images of all sites are compared to all sites in one
-    (n, K, n) distance evaluation, replacing an i<j x |G| triple loop per
-    One token is one orbit and one element by construction now that
-    `resolve_site_conflicts` keeps distinct sites' orbits apart, so on a model
-    that has been through that pass this is a no-op safety net -- a non-zero
-    edit count means two sites were merged by the group after all.
-    """
+   
     frac, mask, types = out['frac'], out['mask'], out['sampled_types']
     raw, probs = out.get('sampled_types_raw'), out.get('type_probs')
     total_changed = 0
@@ -5818,18 +5038,6 @@ def expand_generated(out, sg_pred, num_types, max_atoms=80, symprec=0.1,
                      target_vpa=None, rescale_volume=True, merge_dist=0.75,
                      resolved_orbits=None, priority=None):
     """Replicate the asymmetric unit into the full cell.
-
-    `resolved_orbits`, when given, is the per-site orbit `resolve_site_conflicts`
-    already accepted; it is used verbatim. Orbits are fractional, so they do not
-    depend on which matrix the cell is finally written in.
-
-    An orbit is ATOMIC here: it is emitted whole or not at all. The previous
-    version dropped the individual images that clashed with an earlier site,
-    which produced an atom set that is not closed under the space group -- the
-    output then failed its own symmetry check even though every site was placed
-    correctly. Clashes are resolved upstream now; truncation against
-    `max_atoms` still happens, and it too drops whole sites, lowest priority
-    first.
     """
     import numpy as np
     if reconcile_types:
@@ -6022,12 +5230,6 @@ def enforce_unique_types(types, probs, mask, max_unique):
 def smact_balance_types(types_v, probs, mask, ox_states_padded, ox_states_mask,
                         max_edits=8, atomic_numbers=None, site_weights=None):
     """Greedy charge-neutrality edit pass.
-
-    `site_weights` is the Wyckoff multiplicity of each site. When the input is
-    an asymmetric unit (which it is), the composition that must balance is the
-    multiplicity-weighted one; editing an asymmetric-unit site changes its whole
-    orbit at once, so the space-group symmetry of the expanded cell survives.
-    Defaults to 1 per site, reproducing the old (cell = asym unit) behaviour.
     """
     import itertools
     from collections import Counter
@@ -6194,15 +5396,7 @@ def structural_validity(frac, L, mask, types, radii_lut,
 def _smact_valid_composition(zs, counts, ox_table, en_table, metal_set,
                              use_pauling_test=True, include_alloys=True,
                              max_combos=400000):
-    """CDVAE's `smact_validity`, reimplemented exactly.
-
-    In order: a single distinct element passes unconditionally; all-metal
-    compositions pass (alloy exemption); otherwise some integer oxidation assignment
-    must give sum(count_i * ox_i) == 0 AND pass the electronegativity test. Counts are
-    reduced by gcd, as smact.neutral_ratios only yields ratios in lowest terms.
-
-    Checked against the installed `smact` package on 600 random compositions:
-    600/600 agreement.
+    """ Checked against the installed `smact` package on 600 random compositions:
     """
     import itertools
     zs = [int(z) for z in zs]
@@ -6270,15 +5464,6 @@ def composition_validity(types, mask, ox_states_padded=None, ox_states_mask=None
                          include_alloys=True, use_model_table=False,
                          eneg_lut=None, metal_lut=None):
     """SMACT composition validity, matching the published CDVAE gate.
-
-    `types` are VOCABULARY indices; `atomic_numbers` maps them to Z. Passing
-    `atomic_numbers=None` assumes the indices are already atomic numbers.
-
-    `use_model_table=True` reproduces the old, stricter behaviour (the model's
-    own oxidation-state table, no Pauling test, no alloy exemption) and is a
-    DIAGNOSTIC only -- it is not the number to report. With the SMACT tables now
-    baked in, the two agree by construction unless the vocabulary contains an
-    element SMACT does not cover.
     """
     tv = types.detach().cpu().numpy()
     mb = mask.detach().cpu().numpy() > 0.5
@@ -6386,12 +5571,6 @@ def generate_and_evaluate(model, train_targets, device='cpu', quantiles=None,
                           n_per=32, steps=100, temperature=0.0, guidance=None,
                           results_path=None, train_dataset=None):
     """Sample the trained model and score it.
-
-    Adds the two numbers that were missing: whether the conditioning variable
-    actually MOVES the generated structures (rank correlation between the target
-    and the property re-read off the generated crystal), and whether the
-    compositions are novel with respect to the training split. Neither replaces
-    a DFT check or a StructureMatcher match-rate against a reference set.
     """
     cfg = model.cfg
     model.eval()
@@ -6483,9 +5662,7 @@ def generate_and_evaluate(model, train_targets, device='cpu', quantiles=None,
         print(f"  wrote {results_path}")
     return rows
 
-# ==============================================================================
-# 11  CONFIGURATION AND ENTRY POINTS
-# ==============================================================================
+
 
 @dataclass
 class DirectFlowConfig:
@@ -6706,10 +5883,10 @@ def config_from_dict(d, **overrides):
         cfg.weights = merged
     return cfg
 
-# Where the mined MP-20 dataset lives (train/ val/ test/ subfolders). Resolved from the
-# environment so that no machine-specific path is stored in the code; see data/README.md.
+# Where the mined MP-20 dataset lives (train/ val/ test/ subfolders). 
+
 DEFAULT_DATA_ROOT = os.environ.get("MP20_ROOT", os.path.join("data", "MP20"))
-# Where run() writes checkpoints when no directory is given.
+
 DEFAULT_CKPT_DIR = os.environ.get("EMF_CKPT_DIR", "checkpoints")
 
 
@@ -6732,11 +5909,6 @@ def default_config():
         'stage3_ckpt': 'stage3_finetune.pt',
         'stage3_metrics_path': None,
 
-        # 20 covers MP-20's ceiling: a P1 cell of 20 atoms has 20 asymmetric
-        # sites, which fit exactly in 20 tokens; symmetric cells need fewer.
-        # The dataset loader prints the true max per split at load time and
-        # WARNS if any asymmetric unit exceeds this -- raise n_sites only if it
-        # does (i.e. if the mine keeps conventional cells above 20 atoms).
         'n_sites': 20,
         'pos_freqs': 6,
         'use_pos_features': True,
@@ -6988,12 +6160,7 @@ def main(config: dict, encoder_path=None):
         patience=config.get('flow_patience', 0),
     )
 
-    # Full-depth (sampling-resolution) health check on the flow BEFORE stage 3.
-    # Stage 3 used to be the only place diagnostics ran, so a flow that already
-    # collapsed the latent set at 100 steps was indistinguishable from one that
-    # collapsed during fine-tuning. Printing it here establishes the baseline:
-    # a healthy token diversity here (close to the encoded value) means any
-    # later collapse was introduced by stage 3, not inherited from DF.
+    
     try:
         _db0 = next(iter(v_l if v_l is not None else tr_l))
         if not isinstance(_db0, dict):
