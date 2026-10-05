@@ -9,7 +9,23 @@ space group by construction, and the space group can be requested at sampling ti
 
 <p align="center"><img src="docs/assets/overview.png" alt="Overview of SymmFlow" width="720"></p>
 
-
+SymmFlow introduces a symmetry-native representation that makes the space group an ex-
+plicit, user-selectable variable at every stage of generation. Rather than generating coordinates and
+hoping symmetry emerges, SymmFlow operates directly on asymmetric units and Wyckoff po-
+sitions, ensuring that every output is a union of complete crystallographic orbits on a lattice of
+the correct family by construction.
+Key technical innovations include:
+1. A lossless latent representation based on asymmetric units and canonical site tokens,
+validated across 8,668 MP-20 test structures (median atom-count ratio of 1.00).
+2. Constrained decoding that projects coordinates onto selected Wyckoff positions, sizes the
+cell using exact site multiplicities, and resolves collisions within symmetry subspaces.
+3. Exact symmetry control: 100% space-group match across six requested groups (192 sam-
+ples), with a shuffled-conditioning control demonstrating that symmetry is imposed by the
+decoder rather than learned by the flow.
+4. Competitive unconditional generation: 99.99% structural validity, and 90.4%/96.9%
+coverage recall/precision at standard thresholds.
+5. Conditional generation It supports formation-energy-conditioned generation and shifts
+generated structures in the requested property direction
 
 ## Contents
 
